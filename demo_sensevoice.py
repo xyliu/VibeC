@@ -5,11 +5,12 @@ import numpy as np
 import sherpa_onnx
 import os
 import sys
+import winsound
 
 # ================= 配置参数 =================
-# 请确保下载了 sherpa-onnx 的 SenseVoice 模型，并解压在当前目录
-MODEL_DIR = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+MODEL_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 HOTKEY = "f8"
+EXIT_HOTKEY = "ctrl+shift+q" # 退出程序的快捷键
 
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
@@ -26,6 +27,8 @@ def record_audio():
                     frames_per_buffer=CHUNK)
 
     print(f"\n🎤 [录音中] 请对着麦克风说话... (松开 {HOTKEY} 键结束)")
+    # 播放提示音，表示开始录音
+    winsound.Beep(1500, 100)
     frames = []
 
     while keyboard.is_pressed(HOTKEY):
@@ -33,6 +36,8 @@ def record_audio():
         frames.append(data)
 
     print("⏸️ [录音结束] 正在调用 SenseVoice 进行推理...")
+    # 播放提示音，表示录音结束
+    winsound.Beep(1000, 100)
     stream.stop_stream()
     stream.close()
     p.terminate()
@@ -43,9 +48,18 @@ def record_audio():
     audio_float32 = audio_int16.astype(np.float32) / 32768.0
     return audio_float32
 
+def get_application_path():
+    """获取程序运行时的绝对目录，兼容 PyInstaller 打包后的 exe"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
 def main():
-    model_file = os.path.join(MODEL_DIR, "model.onnx")
-    tokens_file = os.path.join(MODEL_DIR, "tokens.txt")
+    app_path = get_application_path()
+    model_dir = os.path.join(app_path, MODEL_DIR_NAME)
+    model_file = os.path.join(model_dir, "model.onnx")
+    tokens_file = os.path.join(model_dir, "tokens.txt")
     
     if not os.path.exists(model_file):
         print(f"❌ 找不到模型文件: {model_file}")
@@ -64,6 +78,8 @@ def main():
     )
     print("✅ SenseVoice 加载成功！")
     print(f"👉 按住【{HOTKEY}】键说话测试。")
+    print(f"👉 按下【{EXIT_HOTKEY}】键退出后台程序。")
+    winsound.Beep(600, 200) # 程序启动成功的提示音
 
     while True:
         try:
@@ -85,9 +101,10 @@ def main():
                     keyboard.write(text)
                     keyboard.write(" ")
                     
-                time.sleep(0.5)
+                time.sleep(0.3)
                 
-            if keyboard.is_pressed('esc'):
+            if keyboard.is_pressed(EXIT_HOTKEY):
+                winsound.Beep(400, 300)
                 break
             time.sleep(0.05) 
             
