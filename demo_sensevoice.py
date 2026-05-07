@@ -22,11 +22,15 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 MAX_RECORD_SECONDS = 60.0
+# 麦克风设备索引：None 为自动选择（启动时会列出所有设备）。
+# 如果声音全是静音，请把下面的 None 改为正确的设备编号
+MIC_DEVICE_INDEX = None
 # ============================================
 
 # 全局状态变量，用于在后台线程和 UI 线程之间通信
 is_recording = False
 recording_start = 0
+realtime_text = ""
 
 def get_application_path():
     """获取程序运行时的绝对目录，兼容 PyInstaller 打包后的 exe"""
@@ -34,6 +38,36 @@ def get_application_path():
         return os.path.dirname(sys.executable)
     else:
         return os.path.dirname(os.path.abspath(__file__))
+
+def find_mic_device():
+    """枚举并打印所有麦克风设备，返回应使用的设备索引"""
+    p = pyaudio.PyAudio()
+    print("\n===== 可用麦克风设备列表 =====")
+    input_devices = []
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info['maxInputChannels'] > 0:
+            input_devices.append((i, info['name']))
+            marker = " <-- 当前默认" if i == p.get_default_input_device_info()['index'] else ""
+            print(f"  [{i}] {info['name']}{marker}")
+    p.terminate()
+    
+    if MIC_DEVICE_INDEX is not None:
+        print(f"\n✅ 使用配置的设备索引: {MIC_DEVICE_INDEX}")
+        return MIC_DEVICE_INDEX
+    
+    default_idx = None
+    p2 = pyaudio.PyAudio()
+    try:
+        default_idx = p2.get_default_input_device_info()['index']
+    except:
+        pass
+    p2.terminate()
+    
+    print(f"\n⚠️ 正在使用系统默认设备 [索引 {default_idx}]")
+    print("⚠️ 如果识别结果RMS始终为 0.0000，请修改脚本头部的 MIC_DEVICE_INDEX 为正确的设备编号")
+    print("============================\n")
+    return default_idx
 
 def toggle_recording():
     """快捷键回调函数：切换录音状态"""
@@ -46,6 +80,9 @@ def background_task():
     
     # 注册全局快捷键并拦截系统原生按键事件 (suppress=True 代表彻底屏蔽 Windows 自身的 Win+H 语音输入面板)
     keyboard.add_hotkey(HOTKEY, toggle_recording, suppress=True)
+    
+    # 启动时先确认麦克风设备
+    mic_device_idx = find_mic_device()
     
     app_path = get_application_path()
     model_dir = os.path.join(app_path, MODEL_DIR_NAME)
@@ -77,12 +114,29 @@ def background_task():
                 frames = []
                 
                 p = pyaudio.PyAudio()
-                stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+                stream = p.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    input_device_index=mic_device_idx,  # 使用经过确认的设备
+                    frames_per_buffer=CHUNK
+                )
 
-                # 持续录音，直到再次按下快捷键(改变了 is_recording 状态)，或者达到 60 秒上限
+                global realtime_text
+                # 录音期间不做任何推理，仅用动态点副提示用户正在说话
+                dots_counter = 0
+
+                # 持续录音，直到再次按下快捷键，或者达到 60 秒上限
                 while is_recording and (time.time() - recording_start) <= MAX_RECORD_SECONDS:
                     data = stream.read(CHUNK, exception_on_overflow=False)
                     frames.append(data)
+
+                    # 每隔大约 0.5 秒更新一下动态小灯动画 (CHUNK=1024, 约 64ms/块)
+                    chunks_per_half_sec = int(0.5 * RATE / CHUNK)
+                    if len(frames) % chunks_per_half_sec == 0:
+                        dots_counter = (dots_counter + 1) % 4
+                        realtime_text = "识别中" + "●" * dots_counter + "○" * (3 - dots_counter)
 
                 # 确保状态被重置（处理 60 秒超时自动停止的情况）
                 is_recording = False
@@ -92,28 +146,32 @@ def background_task():
                 p.terminate()
 
                 # 只有录到了有效音频才进行推理
+                print(f"🔍 [诊断] 录音帧数: {len(frames)}, 预估时长: {len(frames) * CHUNK / RATE:.2f}s")
                 if len(frames) > 5:
                     raw_data = b''.join(frames)
                     audio_int16 = np.frombuffer(raw_data, dtype=np.int16)
                     audio_float32 = audio_int16.astype(np.float32) / 32768.0
-
+                    rms = float(np.sqrt(np.mean(audio_float32**2)))
+                    print(f"🔍 [诊断] 样本数: {len(audio_float32)}, RMS音量: {rms:.4f} (低于0.001说明麦克风无声音)")
                     start_time = time.time()
                     c_stream = recognizer.create_stream()
                     c_stream.accept_waveform(RATE, audio_float32)
                     recognizer.decode_stream(c_stream)
-                    
                     text = c_stream.result.text
                     elapsed = time.time() - start_time
-                    print(f"📝 [识别结果] (耗时 {elapsed:.2f}s): {text}")
-                    
+                    print(f"📝 [识别结果] (耗时 {elapsed:.2f}s) 原始输出: '{text}'")
                     if text:
-                        # 确保物理修饰键完全松开，防止注入文本时误触发系统级快捷键 (比如 Win + e 变成打开资源管理器)
                         keyboard.release('windows')
                         keyboard.release('h')
+                        realtime_text = text
                         keyboard.write(text)
                         keyboard.write(" ")
-                        
-                time.sleep(0.3) # 防止推理结束后瞬间误触
+                        time.sleep(1.0)
+                    else:
+                        print("⚠️ [诊断] 结果为空！若RMS>0.001则为模型问题。")
+                realtime_text = ""
+                time.sleep(0.3)
+
                 
             if keyboard.is_pressed(EXIT_HOTKEY):
                 winsound.Beep(400, 300)
@@ -130,19 +188,20 @@ def background_task():
 class OverlayUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.theme = "dark" # 默认暗色主题
+        self.theme = "light" # 默认暗色主题 
         # 移除边框、置顶、不在任务栏显示
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         # 允许真正的背景透明
         self.setAttribute(Qt.WA_TranslucentBackground)
         
-        self.size_px = 220
-        self.setFixedSize(self.size_px, self.size_px)
+        self.w_px = 550
+        self.h_px = 350
+        self.setFixedSize(self.w_px, self.h_px)
         
         # 居中显示
         desktop = QApplication.desktop()
         rect = desktop.availableGeometry()
-        self.move((rect.width() - self.size_px) // 2, (rect.height() - self.size_px) // 2)
+        self.move((rect.width() - self.w_px) // 2, (rect.height() - self.h_px) // 2)
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_ui)
@@ -171,8 +230,14 @@ class OverlayUI(QWidget):
         # 开启完美的抗锯齿
         painter.setRenderHint(QPainter.Antialiasing)
         
+        # 计算圆环的位置，使其水平居中并靠上
+        dial_size = 220
+        offset_x = (self.w_px - dial_size) / 2
+        offset_y = 10
+        
         padding = 20
-        rect = QRectF(padding, padding, self.size_px - padding*2, self.size_px - padding*2)
+        rect = QRectF(offset_x + padding, offset_y + padding, dial_size - padding*2, dial_size - padding*2)
+        dial_rect = QRectF(offset_x, offset_y, dial_size, dial_size)
         
         # 根据当前主题动态配置颜色
         if self.theme == "dark":
@@ -218,25 +283,46 @@ class OverlayUI(QWidget):
         
         # 1. 阴影/高光层 (偏移 2 像素)
         painter.setPen(c_shadow)
-        shadow_rect = self.rect().adjusted(2, 2, 2, 2)
+        shadow_rect = dial_rect.adjusted(2, 2, 2, 2)
         painter.drawText(shadow_rect, Qt.AlignCenter, text)
         
         # 2. 本体层
         painter.setPen(c_text)
-        painter.drawText(self.rect(), Qt.AlignCenter, text)
+        painter.drawText(dial_rect, Qt.AlignCenter, text)
         
         # --- 绘制底部小字 ---
         font_small = QFont("Segoe UI", 10)
         font_small.setLetterSpacing(QFont.AbsoluteSpacing, 2.0)
         painter.setFont(font_small)
         
-        text_rect_shadow = self.rect().adjusted(2, 62, 2, 2)
+        text_rect_shadow = dial_rect.adjusted(2, 62, 2, 2)
         painter.setPen(c_shadow)
         painter.drawText(text_rect_shadow, Qt.AlignCenter, "MAX 01:00")
         
-        text_rect = self.rect().adjusted(0, 60, 0, 0)
+        text_rect = dial_rect.adjusted(0, 60, 0, 0)
         painter.setPen(c_subtext)
         painter.drawText(text_rect, Qt.AlignCenter, "MAX 01:00")
+        
+        # --- 绘制实时悬浮字幕板 ---
+        global realtime_text
+        if realtime_text:
+            box_margin = 30
+            box_y = offset_y + dial_size + 10
+            box_h = self.h_px - box_y - 20
+            box_rect = QRectF(box_margin, box_y, self.w_px - box_margin*2, box_h)
+            
+            # 画一个带磨砂质感的半透明圆角矩形底板
+            box_color = QColor(30, 30, 40, 180) if self.theme == "dark" else QColor(240, 240, 245, 220)
+            painter.setBrush(box_color)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(box_rect, 15, 15)
+            
+            # 绘制字幕文字
+            painter.setPen(c_text)
+            subtitle_font = QFont("Microsoft YaHei", 14) # 微软雅黑，适合展示中文
+            painter.setFont(subtitle_font)
+            text_rect_inner = box_rect.adjusted(20, 15, -20, -15)
+            painter.drawText(text_rect_inner, Qt.AlignCenter | Qt.TextWordWrap, realtime_text)
 
 def create_tray_icon(app, overlay):
     """创建系统托盘图标和右键菜单"""
