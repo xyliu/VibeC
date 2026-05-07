@@ -8,8 +8,8 @@ import sys
 import winsound
 import threading
 
-from PyQt5.QtWidgets import QApplication, QWidget
-from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QLinearGradient
+from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QMessageBox
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QLinearGradient, QIcon, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QRectF
 
 # ================= 配置参数 =================
@@ -130,6 +130,7 @@ def background_task():
 class OverlayUI(QWidget):
     def __init__(self):
         super().__init__()
+        self.theme = "dark" # 默认暗色主题
         # 移除边框、置顶、不在任务栏显示
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         # 允许真正的背景透明
@@ -173,57 +174,126 @@ class OverlayUI(QWidget):
         padding = 20
         rect = QRectF(padding, padding, self.size_px - padding*2, self.size_px - padding*2)
         
-        # 绘制底部背景圆环 (提高不透明度，使用深色半透明防止在浅色背景看不清)
-        # QColor 参数为 (R, G, B, Alpha透明度：255为完全不透明)
-        pen_bg = QPen(QColor(50, 50, 60, 160), 14) 
-        pen_bg.setCapStyle(Qt.RoundCap) # 圆角线头
+        # 根据当前主题动态配置颜色
+        if self.theme == "dark":
+            c_bg = QColor(50, 50, 60, 160)
+            c_grad_start = QColor(0, 255, 204, 255)  # 青色
+            c_grad_end = QColor(153, 51, 255, 255)   # 紫色
+            c_text = QColor(255, 255, 255, 255)
+            c_shadow = QColor(0, 0, 0, 160)
+            c_subtext = QColor(255, 255, 255, 200)
+        else:
+            c_bg = QColor(240, 240, 245, 200)        # 明亮模式：浅灰白底色
+            c_grad_start = QColor(0, 102, 255, 255)  # 深海蓝
+            c_grad_end = QColor(0, 204, 102, 255)    # 翡翠绿
+            c_text = QColor(30, 30, 40, 255)         # 深色文字
+            c_shadow = QColor(255, 255, 255, 200)    # 明亮模式下的白色高光/阴影
+            c_subtext = QColor(80, 80, 90, 220)
+
+        # 绘制底部背景圆环
+        pen_bg = QPen(c_bg, 14) 
+        pen_bg.setCapStyle(Qt.RoundCap)
         painter.setPen(pen_bg)
-        painter.drawArc(rect, 0, 360 * 16) # Qt 中的角度单位是 1/16 度
+        painter.drawArc(rect, 0, 360 * 16)
         
-        # 创建现代感渐变色 (青色到紫色的赛博朋克渐变，提升纯度与完全不透明度)
+        # 创建现代感渐变色
         gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0.0, QColor(0, 255, 204, 255))   # 亮青色，完全不透明
-        gradient.setColorAt(1.0, QColor(153, 51, 255, 255))  # 亮紫色，完全不透明
+        gradient.setColorAt(0.0, c_grad_start)
+        gradient.setColorAt(1.0, c_grad_end)
         
         # 绘制进度渐变圆弧
         pen_fg = QPen(gradient, 14)
         pen_fg.setCapStyle(Qt.RoundCap)
         painter.setPen(pen_fg)
         
-        # startAngle: 90度(12点钟方向)
-        # spanAngle: 负数代表顺时针
+        # startAngle: 90度(12点钟方向), spanAngle: 负数代表顺时针
         start_angle = 90 * 16
         span_angle = -int((elapsed / MAX_RECORD_SECONDS) * 360 * 16)
         painter.drawArc(rect, start_angle, span_angle)
         
         # --- 绘制中心时间文字 ---
-        font = QFont("Segoe UI", 32, QFont.Bold) # 字体微调大一点，显得现代
+        font = QFont("Segoe UI", 32, QFont.Bold)
         painter.setFont(font)
         text = f"00:{int(elapsed):02d}"
         
-        # 1. 画黑色半透明阴影 (向右下偏移 2 像素)，防止在浅色 IDE 下看不清文字
-        painter.setPen(QColor(0, 0, 0, 160))
+        # 1. 阴影/高光层 (偏移 2 像素)
+        painter.setPen(c_shadow)
         shadow_rect = self.rect().adjusted(2, 2, 2, 2)
         painter.drawText(shadow_rect, Qt.AlignCenter, text)
         
-        # 2. 画纯白色文字本体
-        painter.setPen(QColor(255, 255, 255, 255))
+        # 2. 本体层
+        painter.setPen(c_text)
         painter.drawText(self.rect(), Qt.AlignCenter, text)
         
         # --- 绘制底部小字 ---
         font_small = QFont("Segoe UI", 10)
-        font_small.setLetterSpacing(QFont.AbsoluteSpacing, 2.0) # 增加字间距更有设计感
+        font_small.setLetterSpacing(QFont.AbsoluteSpacing, 2.0)
         painter.setFont(font_small)
         
-        # 1. 底部小字阴影
         text_rect_shadow = self.rect().adjusted(2, 62, 2, 2)
-        painter.setPen(QColor(0, 0, 0, 160))
+        painter.setPen(c_shadow)
         painter.drawText(text_rect_shadow, Qt.AlignCenter, "MAX 01:00")
         
-        # 2. 底部小字本体 (提高可见度)
         text_rect = self.rect().adjusted(0, 60, 0, 0)
-        painter.setPen(QColor(255, 255, 255, 200))
+        painter.setPen(c_subtext)
         painter.drawText(text_rect, Qt.AlignCenter, "MAX 01:00")
+
+def create_tray_icon(app, overlay):
+    """创建系统托盘图标和右键菜单"""
+    # 强制应用程序在所有窗口隐藏时(表盘平时是隐藏的)不退出
+    app.setQuitOnLastWindowClosed(False)
+    
+    tray_icon = QSystemTrayIcon(app)
+    
+    # 代码动态生成一个简单的托盘图标（青色圆球），避免打包依赖外部图片文件
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor("#00FFCC"))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(4, 4, 56, 56)
+    painter.end()
+    tray_icon.setIcon(QIcon(pixmap))
+    
+    menu = QMenu()
+    
+    # 菜单1：使用说明
+    action_help = QAction("📝 使用说明", menu)
+    def show_help():
+        msg = QMessageBox()
+        msg.setWindowTitle("使用说明")
+        msg.setText(f"🚀 Web Coding 极速语音助手\n\n1. 单击键盘 [ {HOTKEY.upper()} ] 唤醒表盘并开始录音。\n2. 说完后再次单击结束。\n3. 程序会瞬间进行 AI 推理，并在光标处自动打字。\n\n如需强制退出，请点击此处的'完全退出'。")
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowFlags(Qt.WindowStaysOnTopHint)
+        msg.exec_()
+    action_help.triggered.connect(show_help)
+    menu.addAction(action_help)
+    
+    # 菜单2：切换主题
+    action_theme = QAction("🎨 切换主题 (明亮/黑暗)", menu)
+    def toggle_theme():
+        if overlay.theme == "dark":
+            overlay.theme = "light"
+            tray_icon.showMessage("主题切换", "已切换至【明亮模式】", QSystemTrayIcon.Information, 1000)
+        else:
+            overlay.theme = "dark"
+            tray_icon.showMessage("主题切换", "已切换至【黑暗模式】", QSystemTrayIcon.Information, 1000)
+    action_theme.triggered.connect(toggle_theme)
+    menu.addAction(action_theme)
+    
+    menu.addSeparator()
+    
+    # 菜单3：退出
+    action_exit = QAction("❌ 完全退出", menu)
+    def exit_app():
+        os._exit(0)
+    action_exit.triggered.connect(exit_app)
+    menu.addAction(action_exit)
+    
+    tray_icon.setContextMenu(menu)
+    tray_icon.show()
+    return tray_icon
 
 def main():
     # 启动后台监听与录音线程
@@ -233,6 +303,10 @@ def main():
     # 启动 PyQt 的主事件循环
     app = QApplication(sys.argv)
     overlay = OverlayUI()
+    
+    # 创建并挂载系统托盘 (必须把对象保存下来)
+    tray = create_tray_icon(app, overlay)
+    
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
