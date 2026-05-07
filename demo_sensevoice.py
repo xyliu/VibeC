@@ -7,6 +7,9 @@ import os
 import sys
 import winsound
 import threading
+from ctypes import cast, POINTER
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
 from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QMessageBox
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QLinearGradient, QIcon, QPixmap
@@ -38,6 +41,32 @@ def get_application_path():
         return os.path.dirname(sys.executable)
     else:
         return os.path.dirname(os.path.abspath(__file__))
+
+def get_mic_volume_interface():
+    """获取 Windows 默认麦克风的音量控制接口"""
+    try:
+        # 正确的 pycaw API: GetMicrophone() 获取默认录音设备
+        device = AudioUtilities.GetMicrophone()
+        if device is None:
+            print("⚠️ 未找到默认麦克风设备")
+            return None
+        interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return cast(interface, POINTER(IAudioEndpointVolume))
+    except Exception as e:
+        print(f"⚠️ 无法访问麦克风音量控制: {e}")
+        return None
+
+def get_mic_mute() -> bool:
+    """获取当前麦克风的静音状态"""
+    vol = get_mic_volume_interface()
+    return bool(vol.GetMute()) if vol else False
+
+def set_mic_mute(mute: bool):
+    """设置麦克风静音状态"""
+    vol = get_mic_volume_interface()
+    if vol:
+        vol.SetMute(1 if mute else 0, None)
+        print(f"🎙️ 麦克风静音已{'开启' if mute else '关闭'}")
 
 def find_mic_device():
     """枚举并打印所有麦克风设备，返回应使用的设备索引"""
@@ -119,24 +148,47 @@ def background_task():
                     channels=CHANNELS,
                     rate=RATE,
                     input=True,
-                    input_device_index=mic_device_idx,  # 使用经过确认的设备
+                    input_device_index=mic_device_idx,
                     frames_per_buffer=CHUNK
                 )
 
+                # 录音前：保存原始静音状态，然后强制取消静音
+                original_mute_state = get_mic_mute()
+                if original_mute_state:
+                    print("🎙️ 检测到麦克风被静音，自动取消静音...")
+                    set_mic_mute(False)
+
                 global realtime_text
-                # 录音期间不做任何推理，仅用动态点副提示用户正在说话
-                dots_counter = 0
+                realtime_text = "🎤 等待语音输入..."
+                last_infer_time = time.time()
+                mute_warned = False
 
                 # 持续录音，直到再次按下快捷键，或者达到 60 秒上限
                 while is_recording and (time.time() - recording_start) <= MAX_RECORD_SECONDS:
                     data = stream.read(CHUNK, exception_on_overflow=False)
                     frames.append(data)
 
-                    # 每隔大约 0.5 秒更新一下动态小灯动画 (CHUNK=1024, 约 64ms/块)
-                    chunks_per_half_sec = int(0.5 * RATE / CHUNK)
-                    if len(frames) % chunks_per_half_sec == 0:
-                        dots_counter = (dots_counter + 1) % 4
-                        realtime_text = "识别中" + "●" * dots_counter + "○" * (3 - dots_counter)
+                    # 每隔 0.4 秒做一次伪实时推理
+                    if time.time() - last_infer_time > 0.4 and len(frames) > 5:
+                        raw_tmp = b''.join(frames)
+                        audio_tmp = np.frombuffer(raw_tmp, dtype=np.int16).astype(np.float32) / 32768.0
+
+                        # ---- 麦克风静音检测 ----
+                        rms = float(np.sqrt(np.mean(audio_tmp**2)))
+                        if rms < 0.001:
+                            if not mute_warned:
+                                realtime_text = "⚠️ 麦克风无声音！\n请检查是否被 Mute"
+                                mute_warned = True
+                            last_infer_time = time.time()
+                            continue  # 静音就跳过推理
+
+                        mute_warned = False  # 有声音则清除警告
+                        c_stream = recognizer.create_stream()
+                        c_stream.accept_waveform(RATE, audio_tmp)
+                        recognizer.decode_stream(c_stream)
+                        if c_stream.result.text:
+                            realtime_text = c_stream.result.text
+                        last_infer_time = time.time()
 
                 # 确保状态被重置（处理 60 秒超时自动停止的情况）
                 is_recording = False
@@ -145,32 +197,38 @@ def background_task():
                 stream.close()
                 p.terminate()
 
-                # 只有录到了有效音频才进行推理
-                print(f"🔍 [诊断] 录音帧数: {len(frames)}, 预估时长: {len(frames) * CHUNK / RATE:.2f}s")
+                # 录音结束后：恢复麦克风原始静音状态
+                if original_mute_state:
+                    set_mic_mute(True)
+                    print("🎙️ 已恢复麦克风静音状态")
+
+                # 最终完整推理（用于最精确的上屏结果）
                 if len(frames) > 5:
                     raw_data = b''.join(frames)
                     audio_int16 = np.frombuffer(raw_data, dtype=np.int16)
                     audio_float32 = audio_int16.astype(np.float32) / 32768.0
-                    rms = float(np.sqrt(np.mean(audio_float32**2)))
-                    print(f"🔍 [诊断] 样本数: {len(audio_float32)}, RMS音量: {rms:.4f} (低于0.001说明麦克风无声音)")
-                    start_time = time.time()
-                    c_stream = recognizer.create_stream()
-                    c_stream.accept_waveform(RATE, audio_float32)
-                    recognizer.decode_stream(c_stream)
-                    text = c_stream.result.text
-                    elapsed = time.time() - start_time
-                    print(f"📝 [识别结果] (耗时 {elapsed:.2f}s) 原始输出: '{text}'")
-                    if text:
-                        keyboard.release('windows')
-                        keyboard.release('h')
-                        realtime_text = text
-                        keyboard.write(text)
-                        keyboard.write(" ")
-                        time.sleep(1.0)
+                    rms_final = float(np.sqrt(np.mean(audio_float32**2)))
+                    print(f"🔍 [诊断] 帧数:{len(frames)}, 时长:{len(frames)*CHUNK/RATE:.1f}s, RMS:{rms_final:.4f}")
+                    if rms_final > 0.001:
+                        c_stream = recognizer.create_stream()
+                        c_stream.accept_waveform(RATE, audio_float32)
+                        recognizer.decode_stream(c_stream)
+                        text = c_stream.result.text
+                        print(f"📝 [最终结果]: '{text}'")
+                        if text:
+                            keyboard.release('windows')
+                            keyboard.release('h')
+                            realtime_text = text  # 字幕板展示最终结果
+                            keyboard.write(text)
+                            keyboard.write(" ")
+                            time.sleep(1.0)
                     else:
-                        print("⚠️ [诊断] 结果为空！若RMS>0.001则为模型问题。")
+                        realtime_text = "⚠️ 麦克风无声音！\n请检查是否被 Mute"
+                        time.sleep(2.0)
+
                 realtime_text = ""
                 time.sleep(0.3)
+
 
                 
             if keyboard.is_pressed(EXIT_HOTKEY):
