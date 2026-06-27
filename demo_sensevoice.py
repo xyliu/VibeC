@@ -5,11 +5,13 @@ import numpy as np
 import sherpa_onnx
 import os
 import sys
+import ctypes
 import winsound
 import threading
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from pynput import keyboard as pynput_keyboard
 
 from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QMessageBox
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QLinearGradient, QIcon, QPixmap
@@ -99,16 +101,91 @@ def find_mic_device():
     return default_idx
 
 def toggle_recording():
-    """快捷键回调函数：切换录音状态"""
+    """切换录音状态"""
     global is_recording
     is_recording = not is_recording
+    print(f"DEBUG: 录音状态切换 -> {is_recording}")
+
+pynput_listener = None
+h_suppressed = False
+win_pressed = False
+
+def log_debug(message):
+    try:
+        app_path = get_application_path()
+        log_file = os.path.join(app_path, "keyboard_debug.log")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception as e:
+        print(f"Write log error: {e}")
+
+def is_win_pressed():
+    global win_pressed
+    # 结合钩子消息流中监控的状态与系统 GetAsyncKeyState 状态进行双重校验
+    api_win = bool((ctypes.windll.user32.GetAsyncKeyState(0x5B) & 0x8000) or 
+                   (ctypes.windll.user32.GetAsyncKeyState(0x5C) & 0x8000))
+    state = win_pressed or api_win
+    return state
+
+def win32_event_filter(msg, data):
+    global h_suppressed, win_pressed
+    
+    # 跟踪低级钩子中的 Win 键 (0x5B=LWIN, 0x5C=RWIN) 的按下和弹起
+    if data.vkCode in (0x5B, 0x5C):
+        if msg in (0x0100, 0x0104):
+            win_pressed = True
+            log_debug(f"Win key pressed (vk={hex(data.vkCode)})")
+        elif msg in (0x0101, 0x0105):
+            win_pressed = False
+            log_debug(f"Win key released (vk={hex(data.vkCode)})")
+            
+    # H 键虚拟键码是 0x48
+    if data.vkCode == 0x48:
+        # WM_KEYDOWN = 0x0100, WM_SYSKEYDOWN = 0x0104
+        if msg in (0x0100, 0x0104):
+            win_active = is_win_pressed()
+            log_debug(f"H KeyDown: win_pressed={win_pressed}, api_win={win_active}")
+            if win_active:
+                h_suppressed = True
+                log_debug("Intercepting Win+H KeyDown")
+                # 发送 dummy 键以掩蔽 Win 键，防止释放 Win 键时弹出开始菜单
+                ctypes.windll.user32.keybd_event(0xE8, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xE8, 0, 2, 0)
+                toggle_recording()
+                if pynput_listener:
+                    pynput_listener.suppress_event()
+                return False
+        # WM_KEYUP = 0x0101, WM_SYSKEYUP = 0x0105
+        elif msg in (0x0101, 0x0105):
+            log_debug(f"H KeyUp: h_suppressed={h_suppressed}")
+            if h_suppressed:
+                h_suppressed = False
+                log_debug("Intercepting Win+H KeyUp")
+                if pynput_listener:
+                    pynput_listener.suppress_event()
+                return False
+    return True
 
 def background_task():
-    """后台任务：监听快捷键、录音以及 AI 推理"""
+    """后台任务：录音以及 AI 推理"""
     global is_recording, recording_start
     
-    # 注册全局快捷键并拦截系统原生按键事件 (suppress=True 代表彻底屏蔽 Windows 自身的 Win+H 语音输入面板)
-    keyboard.add_hotkey(HOTKEY, toggle_recording, suppress=True)
+    # 清理历史的键盘调试日志
+    try:
+        app_path = get_application_path()
+        log_file = os.path.join(app_path, "keyboard_debug.log")
+        if os.path.exists(log_file):
+            os.remove(log_file)
+    except:
+        pass
+    log_debug("=== Keyboard listener started ===")
+    
+    # 启动 pynput 全局按键拦截监听器
+    global pynput_listener
+    pynput_listener = pynput_keyboard.Listener(win32_event_filter=win32_event_filter)
+    pynput_listener.start()
+    
+    keyboard.add_hotkey(EXIT_HOTKEY, lambda: os._exit(0))
     
     # 启动时先确认麦克风设备
     mic_device_idx = find_mic_device()
@@ -246,17 +323,16 @@ def background_task():
 class OverlayUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.theme = "light" # 默认暗色主题 
-        # 移除边框、置顶、不在任务栏显示
+        self.theme = "light" 
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
-        # 允许真正的背景透明
         self.setAttribute(Qt.WA_TranslucentBackground)
         
         self.w_px = 550
         self.h_px = 350
         self.setFixedSize(self.w_px, self.h_px)
         
-        # 居中显示
+        # 热键由 background_task 中的 keyboard.hook 处理
+        print("✅ 精准热键钩子 (Win+H) 已启动，Win+Left 等系统快捷键不受影响。")
         desktop = QApplication.desktop()
         rect = desktop.availableGeometry()
         self.move((rect.width() - self.w_px) // 2, (rect.height() - self.h_px) // 2)
@@ -264,7 +340,14 @@ class OverlayUI(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(30)
-        
+
+    def closeEvent(self, event):
+        global pynput_listener
+        if pynput_listener:
+            pynput_listener.stop()
+        keyboard.unhook_all()
+        super().closeEvent(event)
+
     def update_ui(self):
         global is_recording
         if is_recording:
