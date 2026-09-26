@@ -17,7 +17,7 @@ from pynput import keyboard as pynput_keyboard
 
 from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QMessageBox
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QLinearGradient, QIcon, QPixmap
-from PyQt5.QtCore import Qt, QTimer, QRectF
+from PyQt5.QtCore import Qt, QTimer, QRectF, QPoint, QPointF
 
 # 适配 Windows 控制台默认 GBK 编码环境，避免打印状态 Emoji 时发生 Unicode 编码崩溃
 if sys.platform.startswith("win"):
