@@ -132,9 +132,31 @@ def toggle_recording():
     is_recording = not is_recording
     print(f"DEBUG: 录音开关状态 -> {is_recording}")
 
+def ensure_win_h_disabled():
+    # 自动在当前用户注册表中写入 DisabledHotkeys='H'，从根源切断 Windows Explorer 响应 Win+H
+    try:
+        import winreg
+        reg_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_ALL_ACCESS) as key:
+            try:
+                val, _ = winreg.QueryValueEx(key, "DisabledHotkeys")
+            except FileNotFoundError:
+                val = ""
+            if "H" not in val:
+                new_val = val + "H"
+                winreg.SetValueEx(key, "DisabledHotkeys", 0, winreg.REG_SZ, new_val)
+                # 广播设置变更消息，通知系统 Shell 刷新热键规则
+                HWND_BROADCAST = 0xFFFF
+                WM_SETTINGCHANGE = 0x001A
+                ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "TraySettings", 2, 2000, ctypes.byref(ctypes.c_ulong()))
+                print("🔒 已在系统注册表中成功禁用 Win+H 默认绑定！")
+    except Exception as e:
+        print(f"⚠️ 配置系统热键屏蔽项提示: {e}")
+
 pynput_listener = None
 h_suppressed = False
 win_pressed = False
+suppress_next_win_up = False
 
 def log_debug(message):
     try:
@@ -146,8 +168,8 @@ def log_debug(message):
         pass
 
 def win32_event_filter(msg, data):
-    # 底层拦截键盘钩子，精准接管 Win+H，避免触发系统自带面板同时不影响其他组合键
-    global h_suppressed, win_pressed
+    # 深度底层键盘钩子，通过 0xFF 虚拟按键注入与 Win 键抬起拦截彻底阻止系统自带程序
+    global h_suppressed, win_pressed, suppress_next_win_up
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
     WM_SYSKEYDOWN = 0x0104
@@ -156,26 +178,38 @@ def win32_event_filter(msg, data):
     VK_LWIN = 0x5B
     VK_RWIN = 0x5C
     VK_H = 0x48
+    VK_DUMMY = 0xFF  # Windows 未定义保留键，用于标记 Win 键已被消费，防止激活任何系统级操作
 
     vk_code = data.vkCode
 
+    # 监听 Win 键状态
     if vk_code in (VK_LWIN, VK_RWIN):
         if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
             win_pressed = True
         elif msg in (WM_KEYUP, WM_SYSKEYUP):
             win_pressed = False
             h_suppressed = False
+            if suppress_next_win_up:
+                suppress_next_win_up = False
+                # 彻底吞掉这次 Win 键的弹起，避免系统误判为单按 Win 弹出开始菜单或补发事件
+                return False
 
+    # 捕获 H 键
     if vk_code == VK_H:
         if win_pressed:
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 if not h_suppressed:
                     h_suppressed = True
-                    log_debug("Win+H 命中，切换录音状态")
+                    suppress_next_win_up = True
+                    # 关键黑科技：注入 0xFF 虚拟按键，使系统输入管理器认为 Win 键已处理，彻底阻止原生听写面板
+                    ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 2, 0)
+                    log_debug("Win+H 命中，已中和系统动作并切换录音状态")
                     toggle_recording()
                 return False
             elif msg in (WM_KEYUP, WM_SYSKEYUP):
                 return False
+
     return True
 
 def init_qwen3_recognizer(base_dir: str):
@@ -279,6 +313,9 @@ def background_task():
         pass
     log_debug("=== Qwen3-ASR Keyboard Listener Started ===")
 
+    # 启动时确保系统注册表已屏蔽 Win+H 默认唤起行为
+    ensure_win_h_disabled()
+
     global pynput_listener
     pynput_listener = pynput_keyboard.Listener(win32_event_filter=win32_event_filter)
     pynput_listener.start()
@@ -375,9 +412,13 @@ def background_task():
                         text = c_stream.result.text.strip()
                         print(f"📝 [Qwen3-ASR 识别结果]: '{text}'")
                         if text:
-                            # 释放系统按键状态，防止键位冲突干扰自动模拟打字
-                            keyboard.release('windows')
-                            keyboard.release('h')
+                            # 关键防御：严格等待物理 Win 键与 H 键真正释放，防止模拟按键与物理按压冲突唤起系统快捷键
+                            while (ctypes.windll.user32.GetAsyncKeyState(0x5B) & 0x8000) or \
+                                  (ctypes.windll.user32.GetAsyncKeyState(0x5C) & 0x8000) or \
+                                  (ctypes.windll.user32.GetAsyncKeyState(0x48) & 0x8000):
+                                time.sleep(0.03)
+                            time.sleep(0.05)
+
                             realtime_text = text
                             keyboard.write(text)
                             keyboard.write(" ")
