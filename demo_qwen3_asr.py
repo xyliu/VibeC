@@ -34,7 +34,9 @@ MODEL_DIR_NAME = "sherpa-onnx-qwen3-asr-0.6B-int8"
 # 加速后端模式：可选 "gpu"（优先Intel Arc GPU加速，推荐）、"cpu"（纯CPU运算）、"npu"（实验性NPU）
 ACCELERATOR_BACKEND = "gpu"
 
-HOTKEY = "windows+shift+h"
+# 推荐首选快捷键：F8（纯功能键，绝无字符污染，单键极速触发）
+HOTKEY = "f8"
+HOTKEY_DISPLAY = "F8 / Win+Shift+H"
 EXIT_HOTKEY = "ctrl+shift+q"
 
 CHUNK = 1024
@@ -54,6 +56,15 @@ current_backend_label = "Intel Arc GPU"
 target_input_hwnd = None
 status_banner = ""
 status_banner_expire = 0
+
+# 全局持久化 PyAudio 实例，杜绝在录音循环中反复 terminate() 导致的底层 C 内存违规退出
+global_pyaudio_instance = None
+
+def get_shared_pyaudio():
+    global global_pyaudio_instance
+    if global_pyaudio_instance is None:
+        global_pyaudio_instance = pyaudio.PyAudio()
+    return global_pyaudio_instance
 
 def get_application_path():
     # 获取运行目录，确保以源码运行或打包为独立文件时均能正确定位同级模型
@@ -181,62 +192,75 @@ def log_debug(message):
         pass
 
 def win32_event_filter(msg, data):
-    # 底层键盘钩子，精准监听 Win + Shift + H 组合键，吞掉 H 键防止在文本框中打出字符
-    global h_suppressed, win_pressed, shift_pressed, suppress_next_win_up
-    WM_KEYDOWN = 0x0100
-    WM_KEYUP = 0x0101
-    WM_SYSKEYDOWN = 0x0104
-    WM_SYSKEYUP = 0x0105
+    # 底层键盘钩子：支持 F8 单键极速响应（不输入任何字符），同时全面兼容 Win + Shift + H
+    try:
+        global h_suppressed, win_pressed, shift_pressed, suppress_next_win_up
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        WM_SYSKEYDOWN = 0x0104
+        WM_SYSKEYUP = 0x0105
 
-    VK_LWIN = 0x5B
-    VK_RWIN = 0x5C
-    VK_SHIFT = 0x10
-    VK_LSHIFT = 0xA0
-    VK_RSHIFT = 0xA1
-    VK_H = 0x48
-    VK_DUMMY = 0xFF
+        VK_F8 = 0x77
+        VK_LWIN = 0x5B
+        VK_RWIN = 0x5C
+        VK_SHIFT = 0x10
+        VK_LSHIFT = 0xA0
+        VK_RSHIFT = 0xA1
+        VK_H = 0x48
+        VK_DUMMY = 0xFF
 
-    vk_code = data.vkCode
+        vk_code = data.vkCode
 
-    # 监听 Win 键状态
-    if vk_code in (VK_LWIN, VK_RWIN):
-        if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            win_pressed = True
-        elif msg in (WM_KEYUP, WM_SYSKEYUP):
-            win_pressed = False
-            h_suppressed = False
-            if suppress_next_win_up:
-                suppress_next_win_up = False
-                return False
-
-    # 监听 Shift 键状态
-    if vk_code in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT):
-        if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            shift_pressed = True
-        elif msg in (WM_KEYUP, WM_SYSKEYUP):
-            shift_pressed = False
-
-    # 捕获 H 键：同时使用状态变量与系统底层实时状态进行双重校验
-    if vk_code == VK_H:
-        # 实时检测物理 Win 与 Shift 是否按压中
-        is_win_down = win_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_LWIN) & 0x8000) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_RWIN) & 0x8000)
-        is_shift_down = shift_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
-
-        if is_win_down and is_shift_down:
+        # 1. 优先响应 F8 功能键：绝无字符污染，单键切换录音/结束，吞掉按键防止触发应用程序默认快捷键
+        if vk_code == VK_F8:
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                if not h_suppressed:
-                    h_suppressed = True
-                    suppress_next_win_up = True
-                    # 注入虚拟按键中和 Win 状态
-                    ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 0, 0)
-                    ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 2, 0)
-                    log_debug("Win+Shift+H 命中，切换录音状态")
-                    toggle_recording()
+                log_debug("F8 命中，切换录音状态")
+                toggle_recording()
                 return False
             elif msg in (WM_KEYUP, WM_SYSKEYUP):
                 return False
 
-    return True
+        # 2. 监听 Win 键状态
+        if vk_code in (VK_LWIN, VK_RWIN):
+            if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                win_pressed = True
+            elif msg in (WM_KEYUP, WM_SYSKEYUP):
+                win_pressed = False
+                h_suppressed = False
+                if suppress_next_win_up:
+                    suppress_next_win_up = False
+                    return False
+
+        # 3. 监听 Shift 键状态
+        if vk_code in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT):
+            if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                shift_pressed = True
+            elif msg in (WM_KEYUP, WM_SYSKEYUP):
+                shift_pressed = False
+
+        # 4. 捕获 H 键：同时使用状态变量与系统底层实时状态进行双重校验
+        if vk_code == VK_H:
+            is_win_down = win_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_LWIN) & 0x8000) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_RWIN) & 0x8000)
+            is_shift_down = shift_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+
+            if is_win_down and is_shift_down:
+                if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    if not h_suppressed:
+                        h_suppressed = True
+                        suppress_next_win_up = True
+                        # 注入虚拟按键中和 Win 状态
+                        ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 0, 0)
+                        ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 2, 0)
+                        log_debug("Win+Shift+H 命中，切换录音状态")
+                        toggle_recording()
+                    return False
+                elif msg in (WM_KEYUP, WM_SYSKEYUP):
+                    return False
+
+        return True
+    except Exception as e:
+        # 绝不让钩子中的任何意外导致主程序闪退
+        return True
 
 def init_qwen3_recognizer(base_dir: str):
     # 自动探测优先使用可用且完整的模型版本（0.6B 极速版或 1.7B 版）
@@ -361,8 +385,9 @@ def background_task():
         print("⚠️ 未找到可用的 Qwen3-ASR 模型文件，程序进入待命状态。")
         print(f"💡 请将下载好的模型解压到: {model_dir}\n")
 
-    print("👉 单击桌面【悬浮小条】或按下【Win+Shift+H】开启录音，再次单击立即识别上屏。")
-    print(f"👉 按下【{EXIT_HOTKEY}】安全退出后台。")
+    print("👉 单击桌面【悬浮小条】或按下【F8】键开启录音，再次单击立即识别上屏。")
+    print("💡 (注: 同时也完全兼容 Win+Shift+H 组合热键)")
+    print(f"👉 按下【{EXIT_HOTKEY}】或通过托盘菜单安全退出。")
     winsound.Beep(600, 200)
 
     while True:
@@ -378,7 +403,8 @@ def background_task():
                 recording_start = time.time()
                 frames = []
 
-                p = pyaudio.PyAudio()
+                # 使用全局持久单例 PyAudio，彻底避免反复 terminate 导致的内存访问违规退出
+                p = get_shared_pyaudio()
                 stream = p.open(
                     format=FORMAT,
                     channels=CHANNELS,
@@ -425,9 +451,11 @@ def background_task():
 
                 is_recording = False
                 winsound.Beep(1000, 100)
-                stream.stop_stream()
-                stream.close()
-                p.terminate()
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception as stream_err:
+                    print(f"⚠️ 关闭音频流提示: {stream_err}")
 
                 if original_mute_state:
                     set_mic_mute(True)
@@ -449,11 +477,12 @@ def background_task():
                         text = c_stream.result.text.strip()
                         print(f"📝 [Qwen3-ASR 识别结果]: '{text}'")
                         if text:
-                            # 关键防御：严格等待物理 Win 键、Shift 键与 H 键真正释放，防止模拟按键与物理按压冲突
+                            # 关键防御：严格等待物理按键真正释放，防止模拟按键与物理按压冲突
                             while (ctypes.windll.user32.GetAsyncKeyState(0x5B) & 0x8000) or \
                                   (ctypes.windll.user32.GetAsyncKeyState(0x5C) & 0x8000) or \
                                   (ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000) or \
-                                  (ctypes.windll.user32.GetAsyncKeyState(0x48) & 0x8000):
+                                  (ctypes.windll.user32.GetAsyncKeyState(0x48) & 0x8000) or \
+                                  (ctypes.windll.user32.GetAsyncKeyState(0x77) & 0x8000):
                                 time.sleep(0.03)
                             time.sleep(0.05)
 
@@ -465,9 +494,12 @@ def background_task():
                             realtime_text = text
                             status_banner = f"✅ 已上屏: {text[:6]}"
                             status_banner_expire = time.time() + 1.5
-                            keyboard.write(text)
-                            keyboard.write(" ")
-                            time.sleep(0.5)
+                            try:
+                                keyboard.write(text)
+                                keyboard.write(" ")
+                            except Exception as write_err:
+                                print(f"⚠️ 模拟键盘输入异常: {write_err}")
+                            time.sleep(0.3)
                         else:
                             status_banner = "⚠️ 未识别到有效内容"
                             status_banner_expire = time.time() + 1.2
@@ -475,25 +507,21 @@ def background_task():
                         realtime_text = "⚠️ 麦克风无声音信号"
                         status_banner = "⚠️ 麦克风无声音信号"
                         status_banner_expire = time.time() + 1.5
-                        time.sleep(1.2)
+                        time.sleep(1.0)
                 else:
                     status_banner = ""
 
                 realtime_text = ""
-                time.sleep(0.2)
+                time.sleep(0.1)
                 gc.collect()
-
-            if keyboard.is_pressed(EXIT_HOTKEY):
-                winsound.Beep(400, 300)
-                os._exit(0)
 
             time.sleep(0.05)
 
         except KeyboardInterrupt:
-            os._exit(0)
+            break
         except Exception as e:
             print(f"运行异常: {e}")
-            time.sleep(1)
+            time.sleep(0.5)
 
 class FloatingBarUI(QWidget):
     # 极简现代化悬浮小条 (Floating Capsule Bar)，支持鼠标点击录音/结束与随意拖动
@@ -729,7 +757,7 @@ class FloatingBarUI(QWidget):
             painter.setPen(subtext_color)
             font_shortcut = QFont("Segoe UI", 9)
             painter.setFont(font_shortcut)
-            painter.drawText(QRectF(160, 0, self.bar_w - 175, self.bar_h), Qt.AlignVCenter | Qt.AlignRight, "Win+Shift+H")
+            painter.drawText(QRectF(160, 0, self.bar_w - 175, self.bar_h), Qt.AlignVCenter | Qt.AlignRight, "F8 / 快捷键")
 
 def create_tray_icon(app, floating_bar):
     # 构建托盘图标与右键菜单，方便在无控制台模式下管理与退出程序
@@ -762,10 +790,11 @@ def create_tray_icon(app, floating_bar):
             None,
             "使用说明",
             "【VibeC - Qwen3-ASR 语音输入法】\n\n"
-            "1. 鼠标点击桌面顶部的【悬浮小条】或单击快捷键 Win+Shift+H 开始录音\n"
-            "2. 讲话完成后再次点击悬浮小条或单击 Win+Shift+H，自动上屏\n"
-            "3. 鼠标可随意按住悬浮小条拖动到屏幕任意位置\n"
-            "4. 按快捷键 Ctrl+Shift+Q 即可彻底退出程序"
+            "1. 鼠标点击【悬浮小条】或单击键盘【F8】键开始录音\n"
+            "2. 讲话完成后再次点击悬浮小条或单击【F8】，自动上屏\n"
+            "3. 同时也完全兼容按 Win+Shift+H 快捷键触发\n"
+            "4. 鼠标可随意按住悬浮小条拖动到屏幕任意位置\n"
+            "5. 按快捷键 Ctrl+Shift+Q 即可彻底退出程序"
         )
     act_info.triggered.connect(show_info)
     menu.addAction(act_info)
