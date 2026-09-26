@@ -262,57 +262,96 @@ def win32_event_filter(msg, data):
         # 绝不让钩子中的任何意外导致主程序闪退
         return True
 
+def show_model_missing_dialog(target_dir):
+    # 当完全找不到模型组件时，弹出直观的可视化指导窗口，避免无控制台双击时用户不知所措
+    try:
+        QMessageBox.warning(
+            None,
+            "缺少语音识别大模型组件",
+            "【VibeC 启动提示】\n\n"
+            "未能在程序运行路径下找到 Qwen3-ASR 模型文件！\n\n"
+            "📁 请将项目根目录下载好的模型文件夹：\n"
+            "   👉 sherpa-onnx-qwen3-asr-0.6B-int8\n\n"
+            "完整复制到当前程序 exe 所在的目录下：\n"
+            f"   👉 {target_dir}\n\n"
+            "复制完成后重新双击运行即可！"
+        )
+    except Exception:
+        pass
+
 def init_qwen3_recognizer(base_dir: str):
-    # 自动探测优先使用可用且完整的模型版本（0.6B 极速版或 1.7B 版）
+    # 智能多路径自动回溯探测：支持当前exe同级、项目父级目录、工作目录无缝自适应
     global current_backend_label
 
-    candidate_dirs = [
+    app_path = get_application_path()
+    
+    # 按照优先级智能扫描候选根路径
+    possible_roots = []
+    if app_path and os.path.exists(app_path):
+        possible_roots.append(app_path)
+        # 向上回溯一级（例如 dist/ 目录）
+        p1 = os.path.dirname(app_path)
+        if p1 and os.path.exists(p1) and p1 not in possible_roots:
+            possible_roots.append(p1)
+        # 向上回溯两级（例如项目开发根目录，方便打包后直接调试运行）
+        p2 = os.path.dirname(p1)
+        if p2 and os.path.exists(p2) and p2 not in possible_roots:
+            possible_roots.append(p2)
+
+    cwd = os.getcwd()
+    if cwd not in possible_roots:
+        possible_roots.append(cwd)
+
+    candidate_dir_names = [
         ("sherpa-onnx-qwen3-asr-0.6B-int8", "Qwen3 0.6B [极速版]"),
         (base_dir, "Qwen3-ASR"),
         ("qwen3-asr-1.7b-int4", "Qwen3 1.7B [高质量版]")
     ]
 
-    app_path = get_application_path()
     selected_components = None
 
-    for d_name, v_label in candidate_dirs:
-        model_dir = os.path.join(app_path, d_name)
-        if not os.path.exists(model_dir):
-            continue
+    for root_path in possible_roots:
+        for d_name, v_label in candidate_dir_names:
+            model_dir = os.path.join(root_path, d_name) if not os.path.isabs(d_name) else d_name
+            if not os.path.exists(model_dir):
+                continue
 
-        conv_frontend = os.path.join(model_dir, "conv_frontend.onnx")
-        encoder = None
-        for enc_name in ["encoder.int8.onnx", "encoder.int4.onnx", "encoder.onnx"]:
-            p = os.path.join(model_dir, enc_name)
-            if os.path.exists(p):
-                encoder = p
+            conv_frontend = os.path.join(model_dir, "conv_frontend.onnx")
+            encoder = None
+            for enc_name in ["encoder.int8.onnx", "encoder.int4.onnx", "encoder.onnx"]:
+                p = os.path.join(model_dir, enc_name)
+                if os.path.exists(p):
+                    encoder = p
+                    break
+
+            decoder = None
+            for dec_name in ["decoder.int8.onnx", "decoder_step.int4.onnx", "decoder.onnx"]:
+                p = os.path.join(model_dir, dec_name)
+                if os.path.exists(p):
+                    decoder = p
+                    break
+
+            tokenizer_dir = os.path.join(model_dir, "tokenizer")
+            if not os.path.exists(tokenizer_dir):
+                tokenizer_dir = model_dir
+
+            if conv_frontend and os.path.exists(conv_frontend) and encoder and decoder:
+                selected_components = {
+                    "model_dir": model_dir,
+                    "label": v_label,
+                    "conv_frontend": conv_frontend,
+                    "encoder": encoder,
+                    "decoder": decoder,
+                    "tokenizer_dir": tokenizer_dir
+                }
                 break
-
-        decoder = None
-        for dec_name in ["decoder.int8.onnx", "decoder_step.int4.onnx", "decoder.onnx"]:
-            p = os.path.join(model_dir, dec_name)
-            if os.path.exists(p):
-                decoder = p
-                break
-
-        tokenizer_dir = os.path.join(model_dir, "tokenizer")
-        if not os.path.exists(tokenizer_dir):
-            tokenizer_dir = model_dir
-
-        if conv_frontend and os.path.exists(conv_frontend) and encoder and decoder:
-            selected_components = {
-                "model_dir": model_dir,
-                "label": v_label,
-                "conv_frontend": conv_frontend,
-                "encoder": encoder,
-                "decoder": decoder,
-                "tokenizer_dir": tokenizer_dir
-            }
+        if selected_components:
             break
 
     if selected_components is None:
         print("❌ 未能在当前环境中检测到完整的 Qwen3-ASR 模型组件。")
-        print(f"请检查模型存放路径: {os.path.join(app_path, MODEL_DIR_NAME)}")
+        print(f"请将模型文件夹放置在: {os.path.join(app_path, MODEL_DIR_NAME)}")
+        show_model_missing_dialog(app_path)
         return None
 
     model_dir = selected_components["model_dir"]

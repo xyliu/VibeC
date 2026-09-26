@@ -72,12 +72,46 @@ python demo_qwen3_asr.py
 
 ---
 
-## 📦 4. 打包为独立 EXE 桌面软件
+## 📦 4. 打包为独立 EXE 桌面软件与模型存放说明
 
-如果您希望将其打包为独立可执行的 exe 软件，运行：
+### 🌟 方式 A：一键全自动打包与部署 (强烈推荐)
+
+本项目内置了一键自动化打包脚本，会自动完成依赖编译并自动把模型文件夹部署到位：
+
+```bash
+python build_dist.py
+```
+执行完毕后，直接进入 `dist/demo_qwen3_asr/` 双击 `demo_qwen3_asr.exe` 即可直接使用！
+
+---
+
+### 🛠️ 方式 B：手动打包与放置模型说明
+
+如果您使用的是原生 PyInstaller 命令打包：
 
 ```bash
 python -m PyInstaller demo_qwen3_asr.spec
 ```
-打包完成后进入 `dist` 目录，将下载好的模型目录复制到与 `demo_qwen3_asr.exe` 同级目录下即可直接双击运行。
+
+打包成功后，PyInstaller 会在 `dist/` 下生成一个独立运行包文件夹：`dist/demo_qwen3_asr/`。
+
+#### ⚠️ 关键步骤：模型文件该放在哪里？
+请将项目根目录下下载好的 **`sherpa-onnx-qwen3-asr-0.6B-int8`** 文件夹，**完整复制到 `dist/demo_qwen3_asr/` 目录下（即与 `demo_qwen3_asr.exe` 同级）**。
+
+#### 📂 最终完整的绿色发布包目录树结构如下：
+
+```text
+dist/
+└── demo_qwen3_asr/                           <-- 最终可拷贝分发的绿色完整文件夹
+    ├── demo_qwen3_asr.exe                    <-- 核心主程序 (双击直接运行)
+    ├── _internal/                            <-- 系统核心依赖与动态链接库
+    └── sherpa-onnx-qwen3-asr-0.6B-int8/      <-- 【关键】必须放在这里的模型文件夹
+        ├── conv_frontend.onnx                <-- 特征提取前端网络
+        ├── encoder.int8.onnx                 <-- INT8 编码器网络
+        ├── decoder.int8.onnx                 <-- INT8 解码器与 KV Cache 网络
+        └── tokenizer/                        <-- 词表分词器目录
+```
+
+> **💡 贴心提示 (智能多级自动回溯)**：
+> 程序已内置智能多级回溯功能。如果您在开发阶段打完包后直接在 `dist/demo_qwen3_asr/` 下双击 `demo_qwen3_asr.exe`，程序会自动向上回溯两级，优先自动复用项目根目录下的模型文件；若把该文件夹拷贝到其它电脑，请务必保证上述目录树结构完整。
 
