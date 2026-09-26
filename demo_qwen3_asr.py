@@ -1,4 +1,5 @@
 import time
+import math
 import pyaudio
 import keyboard
 import numpy as np
@@ -45,11 +46,14 @@ MAX_RECORD_SECONDS = 60.0
 MIC_DEVICE_INDEX = None
 # ============================================
 
-# 全局运行状态与实时文本缓冲
+# 全局运行状态与悬浮小条交互缓冲
 is_recording = False
 recording_start = 0
 realtime_text = ""
 current_backend_label = "Intel Arc GPU"
+target_input_hwnd = None
+status_banner = ""
+status_banner_expire = 0
 
 def get_application_path():
     # 获取运行目录，确保以源码运行或打包为独立文件时均能正确定位同级模型
@@ -357,13 +361,19 @@ def background_task():
         print("⚠️ 未找到可用的 Qwen3-ASR 模型文件，程序进入待命状态。")
         print(f"💡 请将下载好的模型解压到: {model_dir}\n")
 
-    print("👉 单击【Win+Shift+H】开启录音，再次单击立即识别上屏。")
+    print("👉 单击桌面【悬浮小条】或按下【Win+Shift+H】开启录音，再次单击立即识别上屏。")
     print(f"👉 按下【{EXIT_HOTKEY}】安全退出后台。")
     winsound.Beep(600, 200)
 
     while True:
         try:
             if is_recording:
+                # 记录录音开始前的前台目标窗口句柄，确保无论鼠标如何点击均能精准打字上屏
+                global target_input_hwnd, status_banner, status_banner_expire
+                fg = ctypes.windll.user32.GetForegroundWindow()
+                if fg:
+                    target_input_hwnd = fg
+
                 winsound.Beep(1500, 100)
                 recording_start = time.time()
                 frames = []
@@ -425,6 +435,7 @@ def background_task():
 
                 # 录音完成后执行最终端到端精准识别
                 if recognizer and len(frames) > 5:
+                    status_banner = "⚡ 正在极速识别..."
                     raw_data = b''.join(frames)
                     audio_int16 = np.frombuffer(raw_data, dtype=np.int16)
                     audio_float32 = audio_int16.astype(np.float32) / 32768.0
@@ -446,16 +457,30 @@ def background_task():
                                 time.sleep(0.03)
                             time.sleep(0.05)
 
+                            # 关键焦点还原：将焦点平滑切换回用户最初正在输入的窗口
+                            if target_input_hwnd and ctypes.windll.user32.IsWindow(target_input_hwnd):
+                                ctypes.windll.user32.SetForegroundWindow(target_input_hwnd)
+                                time.sleep(0.05)
+
                             realtime_text = text
+                            status_banner = f"✅ 已上屏: {text[:6]}"
+                            status_banner_expire = time.time() + 1.5
                             keyboard.write(text)
                             keyboard.write(" ")
-                            time.sleep(0.8)
+                            time.sleep(0.5)
+                        else:
+                            status_banner = "⚠️ 未识别到有效内容"
+                            status_banner_expire = time.time() + 1.2
                     else:
                         realtime_text = "⚠️ 麦克风无声音信号"
-                        time.sleep(1.5)
+                        status_banner = "⚠️ 麦克风无声音信号"
+                        status_banner_expire = time.time() + 1.5
+                        time.sleep(1.2)
+                else:
+                    status_banner = ""
 
                 realtime_text = ""
-                time.sleep(0.3)
+                time.sleep(0.2)
                 gc.collect()
 
             if keyboard.is_pressed(EXIT_HOTKEY):
@@ -470,140 +495,243 @@ def background_task():
             print(f"运行异常: {e}")
             time.sleep(1)
 
-class OverlayUI(QWidget):
+class FloatingBarUI(QWidget):
+    # 极简现代化悬浮小条 (Floating Capsule Bar)，支持鼠标点击录音/结束与随意拖动
     def __init__(self):
         super().__init__()
         self.theme = "dark"
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
 
-        self.w_px = 580
-        self.h_px = 360
-        self.setFixedSize(self.w_px, self.h_px)
+        self.bar_w = 330
+        self.bar_h = 44
+        self.setFixedSize(self.bar_w, self.bar_h)
 
-        print("✅ Qwen3 悬浮表盘界面已加载完成。")
+        # 默认放置在屏幕顶部居中偏下位置
         desktop = QApplication.desktop()
         rect = desktop.availableGeometry()
-        self.move((rect.width() - self.w_px) // 2, (rect.height() - self.h_px) // 2)
+        self.center_x = (rect.width() - self.bar_w) // 2
+        self.center_y = 35
+        self.move(self.center_x, self.center_y)
 
+        # 鼠标拖动与交互状态管理
+        self.drag_start_pos = None
+        self.is_dragging = False
+        self.is_hovered = False
+
+        # 应用 Windows 底层无焦点属性，彻底保证鼠标点击不抢走输入框焦点
+        self.apply_no_activate()
+
+        # 30fps 定时器驱动呼吸灯动画与状态同步
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_ui)
+        self.timer.timeout.connect(self.update_state)
         self.timer.start(30)
 
-    def closeEvent(self, event):
-        global pynput_listener
-        if pynput_listener:
-            pynput_listener.stop()
-        keyboard.unhook_all()
-        super().closeEvent(event)
+        self.show()
+        print("✅ Qwen3 悬浮小条 (Floating Bar) 已加载就绪，可随时鼠标点击或快捷键呼出。")
 
-    def update_ui(self):
-        global is_recording
-        if is_recording:
-            if self.isHidden():
-                self.show()
+    def apply_no_activate(self):
+        # 赋予窗口 WS_EX_NOACTIVATE 属性，使鼠标点击窗口时不激活窗口，从而保持光标焦点在原文本框
+        try:
+            hwnd = int(self.winId())
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
+        except Exception as e:
+            print(f"⚠️ 设置 WS_EX_NOACTIVATE 属性提示: {e}")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.apply_no_activate()
+
+    def enterEvent(self, event):
+        self.is_hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.is_hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # 记录点击瞬间的前台窗口，作为输入焦点双保险
+            global target_input_hwnd
+            fg = ctypes.windll.user32.GetForegroundWindow()
+            if fg and fg != int(self.winId()):
+                target_input_hwnd = fg
+
+            self.drag_start_pos = event.globalPos() - self.frameGeometry().topLeft()
+            self.is_dragging = False
+        elif event.button() == Qt.RightButton:
+            self.show_context_menu(event.globalPos())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton and self.drag_start_pos is not None:
+            self.is_dragging = True
+            new_pos = event.globalPos() - self.drag_start_pos
+            self.move(new_pos)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # 如果位移极小，判定为正常单击，触发切换录音
+            if not self.is_dragging:
+                toggle_recording()
+            self.drag_start_pos = None
+            self.is_dragging = False
+
+    def show_context_menu(self, global_pos):
+        menu = QMenu(self)
+
+        act_theme = QAction("🎨 切换主题 (明亮/暗黑)", menu)
+        def on_toggle_theme():
+            self.theme = "light" if self.theme == "dark" else "dark"
             self.update()
-        else:
-            if not self.isHidden():
-                self.hide()
+        act_theme.triggered.connect(on_toggle_theme)
+        menu.addAction(act_theme)
+
+        act_center = QAction("📌 恢复顶部居中", menu)
+        def on_center():
+            desktop = QApplication.desktop()
+            rect = desktop.availableGeometry()
+            self.move((rect.width() - self.bar_w) // 2, 35)
+        act_center.triggered.connect(on_center)
+        menu.addAction(act_center)
+
+        menu.addSeparator()
+        act_exit = QAction("❌ 完全退出", menu)
+        act_exit.triggered.connect(lambda: os._exit(0))
+        menu.addAction(act_exit)
+
+        menu.exec_(global_pos)
+
+    def update_state(self):
+        # 持续触发界面局部重绘以呈现呼吸灯和状态平滑过渡
+        self.update()
 
     def paintEvent(self, event):
-        global is_recording, recording_start, MAX_RECORD_SECONDS, current_backend_label
-        if not is_recording:
-            return
-
-        elapsed = time.time() - recording_start
-        if elapsed > MAX_RECORD_SECONDS:
-            elapsed = MAX_RECORD_SECONDS
+        global is_recording, recording_start, MAX_RECORD_SECONDS, realtime_text
+        global status_banner, status_banner_expire
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        dial_size = 210
-        offset_x = (self.w_px - dial_size) / 2
-        offset_y = 15
+        rect = QRectF(1.5, 1.5, self.bar_w - 3.0, self.bar_h - 3.0)
+        radius = (self.bar_h - 3.0) / 2.0
 
-        padding = 18
-        rect = QRectF(offset_x + padding, offset_y + padding, dial_size - padding*2, dial_size - padding*2)
-        dial_rect = QRectF(offset_x, offset_y, dial_size, dial_size)
+        # 当前是否处于横幅提示阶段 (例如 "⚡ 正在极速识别..." 或 "✅ 已上屏")
+        active_banner = ""
+        if status_banner and (time.time() < status_banner_expire or "识别" in status_banner):
+            active_banner = status_banner
 
+        # 主题色彩适配
         if self.theme == "dark":
-            c_bg = QColor(40, 40, 50, 180)
-            c_grad_start = QColor(0, 220, 255, 255)
-            c_grad_end = QColor(140, 80, 255, 255)
-            c_text = QColor(255, 255, 255, 255)
-            c_shadow = QColor(0, 0, 0, 160)
-            c_subtext = QColor(200, 210, 255, 220)
+            if is_recording:
+                # 录音中：深红暗夜磨砂背景
+                bg_color = QColor(38, 20, 26, 230)
+                border_color = QColor(255, 75, 75, 200)
+            elif active_banner:
+                # 识别与反馈态：紫蓝色微光背景
+                bg_color = QColor(28, 24, 46, 230)
+                border_color = QColor(140, 90, 255, 200)
+            else:
+                # 待命态：半透明极客黑
+                bg_color = QColor(22, 24, 32, 220)
+                border_color = QColor(0, 210, 255, 160) if self.is_hovered else QColor(255, 255, 255, 38)
+            text_color = QColor(245, 248, 255)
+            subtext_color = QColor(160, 175, 200)
         else:
-            c_bg = QColor(240, 240, 245, 200)
-            c_grad_start = QColor(0, 120, 255, 255)
-            c_grad_end = QColor(0, 210, 140, 255)
-            c_text = QColor(30, 30, 40, 255)
-            c_shadow = QColor(255, 255, 255, 200)
-            c_subtext = QColor(80, 80, 90, 220)
+            if is_recording:
+                bg_color = QColor(255, 235, 238, 235)
+                border_color = QColor(245, 60, 60, 210)
+            elif active_banner:
+                bg_color = QColor(242, 238, 255, 235)
+                border_color = QColor(120, 70, 240, 210)
+            else:
+                bg_color = QColor(250, 252, 255, 230)
+                border_color = QColor(0, 140, 255, 160) if self.is_hovered else QColor(180, 190, 205, 120)
+            text_color = QColor(25, 30, 45)
+            subtext_color = QColor(100, 110, 130)
 
-        # 绘制背景圆环
-        pen_bg = QPen(c_bg, 12)
-        pen_bg.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen_bg)
-        painter.drawArc(rect, 0, 360 * 16)
+        # 绘制胶囊背景与边框
+        painter.setBrush(bg_color)
+        painter.setPen(QPen(border_color, 1.5))
+        painter.drawRoundedRect(rect, radius, radius)
 
-        # 进度渐变色
-        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0.0, c_grad_start)
-        gradient.setColorAt(1.0, c_grad_end)
+        # 绘制左侧状态指示器 (待命为青色麦克风小圆点，录音中为动态呼吸红点)
+        btn_center_x = 24.0
+        btn_center_y = self.bar_h / 2.0
 
-        pen_fg = QPen(gradient, 12)
-        pen_fg.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen_fg)
-
-        start_angle = 90 * 16
-        span_angle = -int((elapsed / MAX_RECORD_SECONDS) * 360 * 16)
-        painter.drawArc(rect, start_angle, span_angle)
-
-        # 绘制录音计时
-        font = QFont("Segoe UI", 30, QFont.Bold)
-        painter.setFont(font)
-        text = f"00:{int(elapsed):02d}"
-
-        painter.setPen(c_shadow)
-        painter.drawText(dial_rect.adjusted(2, 2, 2, 2), Qt.AlignCenter, text)
-        painter.setPen(c_text)
-        painter.drawText(dial_rect, Qt.AlignCenter, text)
-
-        # 显示当前使用的引擎与硬件加速标签
-        font_small = QFont("Segoe UI", 9, QFont.Bold)
-        font_small.setLetterSpacing(QFont.AbsoluteSpacing, 1.2)
-        painter.setFont(font_small)
-
-        info_text = current_backend_label
-        text_rect_shadow = dial_rect.adjusted(2, 58, 2, 2)
-        painter.setPen(c_shadow)
-        painter.drawText(text_rect_shadow, Qt.AlignCenter, info_text)
-
-        text_rect = dial_rect.adjusted(0, 56, 0, 0)
-        painter.setPen(c_subtext)
-        painter.drawText(text_rect, Qt.AlignCenter, info_text)
-
-        # 实时动态识别字幕框
-        global realtime_text
-        if realtime_text:
-            box_margin = 25
-            box_y = offset_y + dial_size + 15
-            box_h = self.h_px - box_y - 15
-            box_rect = QRectF(box_margin, box_y, self.w_px - box_margin*2, box_h)
-
-            box_color = QColor(25, 25, 35, 210) if self.theme == "dark" else QColor(245, 245, 250, 230)
-            painter.setBrush(box_color)
+        if is_recording:
+            # 录音中：脉冲呼吸红点
+            pulse = 0.5 + 0.5 * math.sin(time.time() * 7)
+            glow_radius = 8.0 + pulse * 4.0
+            painter.setBrush(QColor(255, 50, 50, int(60 + pulse * 100)))
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(box_rect, 14, 14)
+            painter.drawEllipse(QPoint(int(btn_center_x), int(btn_center_y)), int(glow_radius), int(glow_radius))
 
-            font_caption = QFont("Microsoft YaHei", 12)
-            painter.setFont(font_caption)
-            painter.setPen(QColor(255, 255, 255, 240) if self.theme == "dark" else QColor(30, 30, 40, 240))
-            painter.drawText(box_rect.adjusted(16, 10, -16, -10), Qt.AlignLeft | Qt.TextWordWrap, realtime_text)
+            painter.setBrush(QColor(255, 60, 60))
+            painter.drawEllipse(QPoint(int(btn_center_x), int(btn_center_y)), 5, 5)
 
-def create_tray_icon(app, overlay):
+            # 计算录音计时
+            elapsed = time.time() - recording_start
+            if elapsed > MAX_RECORD_SECONDS:
+                elapsed = MAX_RECORD_SECONDS
+
+            # 显示录音计时
+            painter.setPen(text_color)
+            font_time = QFont("Segoe UI", 10, QFont.Bold)
+            painter.setFont(font_time)
+            time_str = f"00:{int(elapsed):02d}"
+            painter.drawText(QRectF(44, 0, 50, self.bar_h), Qt.AlignVCenter | Qt.AlignLeft, time_str)
+
+            # 显示动态提示或实时转写
+            font_hint = QFont("Microsoft YaHei UI", 9)
+            painter.setFont(font_hint)
+            painter.setPen(subtext_color)
+            display_text = realtime_text if (realtime_text and "Qwen3" not in realtime_text) else "录音中 · 点击停止上屏"
+            painter.drawText(QRectF(100, 0, self.bar_w - 145, self.bar_h), Qt.AlignVCenter | Qt.AlignLeft, display_text)
+
+            # 右侧停止方块图标
+            stop_btn_rect = QRectF(self.bar_w - 34, (self.bar_h - 18) / 2.0, 18, 18)
+            painter.setBrush(QColor(255, 75, 75, 210))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(stop_btn_rect, 4, 4)
+
+        elif active_banner:
+            # 正在识别或上屏反馈
+            painter.setBrush(QColor(140, 80, 255))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(QPoint(int(btn_center_x), int(btn_center_y)), 5, 5)
+
+            painter.setPen(text_color)
+            font_banner = QFont("Microsoft YaHei UI", 10, QFont.Bold)
+            painter.setFont(font_banner)
+            painter.drawText(QRectF(44, 0, self.bar_w - 55, self.bar_h), Qt.AlignVCenter | Qt.AlignLeft, active_banner)
+
+        else:
+            # 待命闲置状态：麦克风小圆点 + 点击录音提示
+            painter.setBrush(QColor(0, 210, 255) if self.theme == "dark" else QColor(0, 140, 255))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(QPoint(int(btn_center_x), int(btn_center_y)), 6, 6)
+
+            # 主提示文字
+            painter.setPen(text_color)
+            font_title = QFont("Microsoft YaHei UI", 10, QFont.Bold)
+            painter.setFont(font_title)
+            painter.drawText(QRectF(44, 0, 115, self.bar_h), Qt.AlignVCenter | Qt.AlignLeft, "🎙️ 点击录音")
+
+            # 快捷键副标题
+            painter.setPen(subtext_color)
+            font_shortcut = QFont("Segoe UI", 9)
+            painter.setFont(font_shortcut)
+            painter.drawText(QRectF(160, 0, self.bar_w - 175, self.bar_h), Qt.AlignVCenter | Qt.AlignRight, "Win+Shift+H")
+
+def create_tray_icon(app, floating_bar):
     # 构建托盘图标与右键菜单，方便在无控制台模式下管理与退出程序
     tray = QSystemTrayIcon()
     pix = QPixmap(32, 32)
@@ -618,21 +746,33 @@ def create_tray_icon(app, overlay):
     tray.setToolTip("VibeC 语音助手 (Qwen3-ASR 加速版)")
 
     menu = QMenu()
+
+    def toggle_bar_visibility():
+        if floating_bar.isVisible():
+            floating_bar.hide()
+        else:
+            floating_bar.show()
+    act_toggle = QAction("👁️ 显示/隐藏悬浮条", menu)
+    act_toggle.triggered.connect(toggle_bar_visibility)
+    menu.addAction(act_toggle)
+
     act_info = QAction("📝 使用说明", menu)
     def show_info():
         QMessageBox.information(
             None,
             "使用说明",
             "【VibeC - Qwen3-ASR 语音输入法】\n\n"
-            "1. 在任意输入框中单击 Win+Shift+H 开始录音\n"
-            "2. 讲话完成后再次单击 Win+Shift+H，自动上屏\n"
-            "3. 按快捷键 Ctrl+Shift+Q 即可彻底退出程序"
+            "1. 鼠标点击桌面顶部的【悬浮小条】或单击快捷键 Win+Shift+H 开始录音\n"
+            "2. 讲话完成后再次点击悬浮小条或单击 Win+Shift+H，自动上屏\n"
+            "3. 鼠标可随意按住悬浮小条拖动到屏幕任意位置\n"
+            "4. 按快捷键 Ctrl+Shift+Q 即可彻底退出程序"
         )
     act_info.triggered.connect(show_info)
     menu.addAction(act_info)
 
     def toggle_theme():
-        overlay.theme = "light" if overlay.theme == "dark" else "dark"
+        floating_bar.theme = "light" if floating_bar.theme == "dark" else "dark"
+        floating_bar.update()
     act_theme = QAction("🎨 切换主题", menu)
     act_theme.triggered.connect(toggle_theme)
     menu.addAction(act_theme)
@@ -653,8 +793,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    overlay = OverlayUI()
-    tray = create_tray_icon(app, overlay)
+    floating_bar = FloatingBarUI()
+    tray = create_tray_icon(app, floating_bar)
 
     t = threading.Thread(target=background_task, daemon=True)
     t.start()
