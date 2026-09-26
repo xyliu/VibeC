@@ -10,9 +10,6 @@ import ctypes
 import winsound
 import threading
 import gc
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from pynput import keyboard as pynput_keyboard
 
 from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QMessageBox
@@ -102,50 +99,29 @@ def check_hardware_accelerator():
 
     return False, "CPU 基础模式", "cpu"
 
-def get_mic_volume_interface():
-    # 访问系统麦克风端点对象，用于自动恢复被误静音的录音状态
-    try:
-        device = AudioUtilities.GetMicrophone()
-        if device is None:
-            return None
-        interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        return cast(interface, POINTER(IAudioEndpointVolume))
-    except Exception as e:
-        print(f"⚠️ 无法访问麦克风接口: {e}")
-        return None
-
-def get_mic_mute() -> bool:
-    vol = get_mic_volume_interface()
-    return bool(vol.GetMute()) if vol else False
-
-def set_mic_mute(mute: bool):
-    vol = get_mic_volume_interface()
-    if vol:
-        vol.SetMute(1 if mute else 0, None)
-        print(f"🎙️ 麦克风静音状态已切换为: {'静音' if mute else '开启'}")
-
 def find_mic_device():
     # 遍历音频输入设备，防止多声卡环境下录入无声通道
-    p = pyaudio.PyAudio()
+    p = get_shared_pyaudio()
     print("\n===== 可用麦克风设备列表 =====")
+    default_idx = None
+    try:
+        default_idx = p.get_default_input_device_info()['index']
+    except Exception:
+        pass
+
     for i in range(p.get_device_count()):
-        info = p.get_device_info_by_index(i)
-        if info['maxInputChannels'] > 0:
-            marker = " <-- 当前默认" if i == p.get_default_input_device_info()['index'] else ""
-            print(f"  [{i}] {info['name']}{marker}")
-    p.terminate()
+        try:
+            info = p.get_device_info_by_index(i)
+            if info['maxInputChannels'] > 0:
+                marker = " <-- 当前默认" if i == default_idx else ""
+                print(f"  [{i}] {info['name']}{marker}")
+        except Exception:
+            pass
 
     if MIC_DEVICE_INDEX is not None:
         print(f"\n✅ 采用手动指定的麦克风设备索引: {MIC_DEVICE_INDEX}")
         return MIC_DEVICE_INDEX
 
-    default_idx = None
-    p2 = pyaudio.PyAudio()
-    try:
-        default_idx = p2.get_default_input_device_info()['index']
-    except Exception:
-        pass
-    p2.terminate()
     print(f"\n✅ 使用系统默认输入设备 [索引 {default_idx}]")
     print("============================\n")
     return default_idx
@@ -453,11 +429,6 @@ def background_task():
                     frames_per_buffer=CHUNK
                 )
 
-                original_mute_state = get_mic_mute()
-                if original_mute_state:
-                    print("🎙️ 检测到麦克风处于静音，自动取消静音以确保正常录音...")
-                    set_mic_mute(False)
-
                 global realtime_text
                 realtime_text = "🎤 Qwen3 正在聆听..."
                 last_infer_time = time.time()
@@ -495,10 +466,6 @@ def background_task():
                     stream.close()
                 except Exception as stream_err:
                     print(f"⚠️ 关闭音频流提示: {stream_err}")
-
-                if original_mute_state:
-                    set_mic_mute(True)
-                    print("🎙️ 录音结束，恢复静音状态")
 
                 # 录音完成后执行最终端到端精准识别
                 if recognizer and len(frames) > 5:
