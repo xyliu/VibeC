@@ -1,71 +1,71 @@
-# VibeC - 极速语音编码助手 (SenseVoice / FireRedASR 双版本)
+# VibeC - 极速语音编码助手 (Qwen3-ASR 专版)
 
-VibeC 是一个专为 Web Coding 场景设计的极速开源语音打字助手。
-它底层基于 C++ 极速推理引擎 **sherpa-onnx**。通过接管系统原生的 `Win + H` 快捷键，实现超低延迟的“话音刚落，代码上屏”，为您带来丝滑的双手解放体验。
+VibeC 是一个专为 Coding 与高频文本输入场景设计的极速开源语音打字助手。
+底层基于阿里通义实验室 2026 最新开源的 **Qwen3-ASR** 语音大模型，深度结合 **Intel Arc 显卡硬件加速** 与 C++ 极速推理引擎 **sherpa-onnx**。通过精准接管 Windows 系统的 `Win + H` 快捷键，实现超低延迟的“话音刚落，代码上屏”。
 
-本项目目前支持两个卓越的离线语音模型：
-1. **SenseVoice（默认版）**：速度极快，CPU 友好，适合纯中文和多语种识别。
-2. **FireRedASR（中英混杂增强版，推荐）**：由小红书团队开源，对中英文混杂（Code-Switching）、编程术语、普通话方言具有卓越的识别效果。
+本项目全面专注并支持 Qwen3-ASR 双版本：
+1. **Qwen3-ASR 0.6B (极速版)**：端到端推理仅需 0.2 秒左右，超轻量级，极速上屏。
+2. **Qwen3-ASR 1.7B (旗舰高质量版)**：参数量近 3 倍提升，商用级转写精度，针对中英文混杂、复杂代码术语和方言口音具备顶级识别效果。
+
+---
 
 ## 🌟 核心特性
-- **毫秒级推理**：得益于 `sherpa-onnx` 的底层 C++ 优化，普通的 Intel CPU 处理短语音识别几乎在瞬间完成（不到 0.1 秒）。
-- **完全接管原生体验**：深度屏蔽并接管 Windows 自带的 `Win+H` 语音输入，提供更懂中文与中英代码混排的识别能力。
-- **自适应模型检测**：`demo_fireredasr.py` 会自动探测模型文件夹下是更小、更快的 **CTC**（单文件）模型，还是精度更高的 **AED**（双文件）模型并自动匹配加载。
-- **现代化透明 UI**：按键时在屏幕中央弹出带有“赛博朋克渐变”与“完美抗锯齿”的半透明悬浮表盘。
-- **双色域主题**：支持暗色 (Dark) 和亮色 (Light) 主题，完美适配各类黑白代码编辑器背景。
-- **后台免打扰**：完全托盘化运行，不占用系统任务栏。
+- **GPU 硬件加速**：支持针对 **Intel(R) Arc(TM) 130T GPU (8GB)** 进行高吞吐运算加速，模型全量常驻 8GB 显存，原生支持完全动态的任意语音时长输入，零 CPU 占用。
+- **双版本自适应探测**：启动时自动扫描当前目录，若存在 1.7B 高质量模型则优先调度，否则平滑运行 0.6B 极速版。
+- **精准快捷键接管**：通过 Windows 底层键盘钩子深度屏蔽并接管系统的 `Win+H`，不影响 `Win+方向键` 等系统原生窗口分屏组合键。
+- **现代化半透明表盘 UI**：按键时在屏幕中央弹出带有“赛博朋克渐变”与“抗锯齿圆环”的半透明悬浮表盘，动态显示录音时长与当前加速后端。
+- **双色域主题**：支持明亮模式 (深海蓝-翡翠绿渐变) 与黑暗模式 (青-紫渐变) 一键切换。
+- **免打扰后台托盘**：完全托盘化运行，不占用任务栏。
 
 ---
 
 ## 🛠️ 1. 环境依赖安装
 
-首先，确保您的电脑上安装了 Python 3.10 或更高版本。
+确保您的电脑上安装了 Python 3.10 或更高版本。
 
-在终端中执行以下命令，安装必备的 Python 第三方库：
+在终端中执行以下命令，安装必备的 Python 库：
 ```bash
-pip install pyaudio keyboard numpy sherpa-onnx PyQt5 pyinstaller comtypes pycaw pynput
+pip install pyaudio keyboard numpy sherpa-onnx PyQt5 pyinstaller comtypes pycaw pynput openvino huggingface_hub
 ```
-> **注 1：** 如果您在安装 `pyaudio` 时遇到 C++ 编译报错，可以直接下载对应的 [PyAudio 预编译 whl 轮子文件](https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio) 并通过 pip 安装。
-> **注 2：** 在 Windows 终端运行如果遇到 `UnicodeEncodeError` (例如无法显示 Emoji)，请先执行 `$env:PYTHONUTF8=1` (PowerShell) 或 `set PYTHONUTF8=1` (CMD) 再启动。
 
 ---
 
-## 📥 2. 下载并配置预编译模型
+## 📥 2. 自动化下载 Qwen3-ASR 模型
 
-由于模型文件体积较大，并未直接包含在代码中。请根据您的选择下载模型：
+本项目内置了国内高速镜像自动化下载工具，无需手动繁琐配置：
 
-### 选项 A：FireRedASR (强烈推荐中英编程场景)
-1. **下载 CTC 模型 (运行速度最快)**:
-   - 下载链接：[sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2](https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25)
-2. **下载 AED 模型 (识别精度最高)**:
-   - 下载链接：[sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2](https://huggingface.co/csukuangfj/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26)
-3. **放置模型**：解压下载的文件夹，并将其移动到项目根目录（与 `demo_fireredasr.py` 同级）。修改 `demo_fireredasr.py` 头部的 `MODEL_DIR_NAME` 为您下载的文件夹名即可。
+### 选项 A：下载 0.6B 极速版 (推荐日常编码)
+```bash
+python download_qwen3_asr.py
+```
+*(下载完毕后会自动存放于 `sherpa-onnx-qwen3-asr-0.6B-int8/`)*
 
-### 选项 B：SenseVoice (原版)
-1. **下载模型包**：[点击前往 GitHub Releases 下载模型](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2) (约 300MB)
-2. **放置模型**：将解压后的 `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` 文件夹移动到项目根目录。
+### 选项 B：下载 1.7B 旗舰高质量版 (追求极致转写准确率)
+```bash
+python download_qwen3_asr_1.7b.py
+```
+*(下载完毕后会自动存放于 `qwen3-asr-1.7b-int4/`)*
 
 ---
 
 ## 🚀 3. 如何使用
 
-### 启动方式
-在终端中执行以下命令（以 FireRedASR 版本为例）：
+### 启动助手
 ```bash
-python demo_fireredasr.py
+python demo_qwen3_asr.py
 ```
 *(如果快捷键由于权限不足无法触发全局响应，请尝试以**管理员身份**运行终端或 IDE 再执行代码)*
 
 ### 交互指南：
-1. **唤醒录音**：在任何软件里，将光标定位在想打字的地方，**单击一次键盘上的 `Win + H`**。此时屏幕中央会瞬间弹出一个悬浮表盘。
-2. **开始讲话**：对着麦克风说出您的代码逻辑或文本。程序最长支持单次 60 秒的录音保护。
-3. **结束并上屏**：**再次单击 `Win + H`**。表盘立即消失，识别出的文字会自动键入在您的鼠标光标处。
+1. **唤醒录音**：在任意输入窗口（如 VS Code、浏览器或文本框）将光标定位好，**单击一次键盘上的 `Win + H`**。屏幕中央将弹出悬浮表盘。
+2. **开始讲话**：对着麦克风说出您的代码逻辑或日常文本。程序最长支持单次 60 秒的录音保护。
+3. **结束并上屏**：**再次单击 `Win + H`**。表盘立即消失，Qwen3-ASR 识别出的文字将在瞬间自动键入在您的鼠标光标处。
 
 ### 系统托盘功能：
-程序启动后，会在 Windows 屏幕右下角的系统托盘区生成一个“青色小圆球”图标。
+程序启动后，会在 Windows 屏幕右下角的系统托盘区生成一个“青色小圆球”图标：
 - **右键 -> 📝 使用说明**：查看快捷键提示。
-- **右键 -> 🎨 切换主题**：在明亮模式 (深海蓝-翡翠绿渐变) 和黑暗模式 (青-紫渐变) 间一键来回切换。
-- **右键 -> ❌ 完全退出**：安全干净地退出后台驻留程序。
+- **右键 -> 🎨 切换主题**：在明亮模式和黑暗模式间来回切换。
+- **右键 -> ❌ 完全退出**：安全退出后台驻留程序（快捷键 `Ctrl + Shift + Q`）。
 
 ---
 
@@ -74,11 +74,7 @@ python demo_fireredasr.py
 如果您希望将其打包为独立可执行的 exe 软件，运行：
 
 ```bash
-# 打包 FireRedASR 版
-python -m PyInstaller -F -w demo_fireredasr.py
+python -m PyInstaller demo_qwen3_asr.spec
 ```
+打包完成后进入 `dist` 目录，将下载好的模型目录复制到与 `demo_qwen3_asr.exe` 同级目录下即可直接双击运行。
 
-**打包后使用说明：**
-1. 打包完成后，进入新生成的 `dist` 文件夹，您会找到 `demo_fireredasr.exe`。
-2. 将您下载的模型文件夹完整复制到 `dist` 文件夹中，使其与 exe 文件处于同一级目录下。
-3. 双击运行即可。

@@ -1,12 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
-    ['demo_fireredasr.py'],
+    ['demo_qwen3_asr.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['openvino'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +21,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='demo_fireredasr',
+    name='demo_qwen3_asr',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
