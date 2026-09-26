@@ -25,7 +25,7 @@ MODEL_DIR_NAME = "sherpa-onnx-qwen3-asr-0.6B-int8"
 # 加速后端模式：可选 "gpu"（优先Intel Arc GPU加速，推荐）、"cpu"（纯CPU运算）、"npu"（实验性NPU）
 ACCELERATOR_BACKEND = "gpu"
 
-HOTKEY = "windows+h"
+HOTKEY = "windows+shift+h"
 EXIT_HOTKEY = "ctrl+shift+q"
 
 CHUNK = 1024
@@ -156,6 +156,7 @@ def ensure_win_h_disabled():
 pynput_listener = None
 h_suppressed = False
 win_pressed = False
+shift_pressed = False
 suppress_next_win_up = False
 
 def log_debug(message):
@@ -168,8 +169,8 @@ def log_debug(message):
         pass
 
 def win32_event_filter(msg, data):
-    # 深度底层键盘钩子，通过 0xFF 虚拟按键注入与 Win 键抬起拦截彻底阻止系统自带程序
-    global h_suppressed, win_pressed, suppress_next_win_up
+    # 底层键盘钩子，精准监听 Win + Shift + H 组合键，吞掉 H 键防止在文本框中打出字符
+    global h_suppressed, win_pressed, shift_pressed, suppress_next_win_up
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
     WM_SYSKEYDOWN = 0x0104
@@ -177,8 +178,11 @@ def win32_event_filter(msg, data):
 
     VK_LWIN = 0x5B
     VK_RWIN = 0x5C
+    VK_SHIFT = 0x10
+    VK_LSHIFT = 0xA0
+    VK_RSHIFT = 0xA1
     VK_H = 0x48
-    VK_DUMMY = 0xFF  # Windows 未定义保留键，用于标记 Win 键已被消费，防止激活任何系统级操作
+    VK_DUMMY = 0xFF
 
     vk_code = data.vkCode
 
@@ -191,20 +195,30 @@ def win32_event_filter(msg, data):
             h_suppressed = False
             if suppress_next_win_up:
                 suppress_next_win_up = False
-                # 彻底吞掉这次 Win 键的弹起，避免系统误判为单按 Win 弹出开始菜单或补发事件
                 return False
 
-    # 捕获 H 键
+    # 监听 Shift 键状态
+    if vk_code in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT):
+        if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            shift_pressed = True
+        elif msg in (WM_KEYUP, WM_SYSKEYUP):
+            shift_pressed = False
+
+    # 捕获 H 键：同时使用状态变量与系统底层实时状态进行双重校验
     if vk_code == VK_H:
-        if win_pressed:
+        # 实时检测物理 Win 与 Shift 是否按压中
+        is_win_down = win_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_LWIN) & 0x8000) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_RWIN) & 0x8000)
+        is_shift_down = shift_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+
+        if is_win_down and is_shift_down:
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 if not h_suppressed:
                     h_suppressed = True
                     suppress_next_win_up = True
-                    # 关键黑科技：注入 0xFF 虚拟按键，使系统输入管理器认为 Win 键已处理，彻底阻止原生听写面板
+                    # 注入虚拟按键中和 Win 状态
                     ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 0, 0)
                     ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 2, 0)
-                    log_debug("Win+H 命中，已中和系统动作并切换录音状态")
+                    log_debug("Win+Shift+H 命中，切换录音状态")
                     toggle_recording()
                 return False
             elif msg in (WM_KEYUP, WM_SYSKEYUP):
@@ -331,7 +345,7 @@ def background_task():
         print("⚠️ 未找到可用的 Qwen3-ASR 模型文件，程序进入待命状态。")
         print(f"💡 请将下载好的模型解压到: {model_dir}\n")
 
-    print(f"👉 单击【{HOTKEY}】开启录音，再次单击立即识别上屏。")
+    print("👉 单击【Win+Shift+H】开启录音，再次单击立即识别上屏。")
     print(f"👉 按下【{EXIT_HOTKEY}】安全退出后台。")
     winsound.Beep(600, 200)
 
@@ -412,9 +426,10 @@ def background_task():
                         text = c_stream.result.text.strip()
                         print(f"📝 [Qwen3-ASR 识别结果]: '{text}'")
                         if text:
-                            # 关键防御：严格等待物理 Win 键与 H 键真正释放，防止模拟按键与物理按压冲突唤起系统快捷键
+                            # 关键防御：严格等待物理 Win 键、Shift 键与 H 键真正释放，防止模拟按键与物理按压冲突
                             while (ctypes.windll.user32.GetAsyncKeyState(0x5B) & 0x8000) or \
                                   (ctypes.windll.user32.GetAsyncKeyState(0x5C) & 0x8000) or \
+                                  (ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000) or \
                                   (ctypes.windll.user32.GetAsyncKeyState(0x48) & 0x8000):
                                 time.sleep(0.03)
                             time.sleep(0.05)
@@ -597,8 +612,8 @@ def create_tray_icon(app, overlay):
             None,
             "使用说明",
             "【VibeC - Qwen3-ASR 语音输入法】\n\n"
-            "1. 在任意输入框中单击 Win+H 开始录音\n"
-            "2. 讲话完成后再次单击 Win+H，自动上屏\n"
+            "1. 在任意输入框中单击 Win+Shift+H 开始录音\n"
+            "2. 讲话完成后再次单击 Win+Shift+H，自动上屏\n"
             "3. 按快捷键 Ctrl+Shift+Q 即可彻底退出程序"
         )
     act_info.triggered.connect(show_info)
