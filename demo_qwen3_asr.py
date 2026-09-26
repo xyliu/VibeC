@@ -18,6 +18,14 @@ from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QActi
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QLinearGradient, QIcon, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QRectF
 
+# 适配 Windows 控制台默认 GBK 编码环境，避免打印状态 Emoji 时发生 Unicode 编码崩溃
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ================= 配置参数 =================
 # Qwen3-ASR 模型目录，支持官方导出的 0.6B INT8 轻量版
 MODEL_DIR_NAME = "sherpa-onnx-qwen3-asr-0.6B-int8"
@@ -227,60 +235,64 @@ def win32_event_filter(msg, data):
     return True
 
 def init_qwen3_recognizer(base_dir: str):
-    # 自动探测优先使用 1.7B 高质量版本还是 0.6B 极速版本
+    # 自动探测优先使用可用且完整的模型版本（0.6B 极速版或 1.7B 版）
     global current_backend_label
 
     candidate_dirs = [
-        ("qwen3-asr-1.7b-int4", "Qwen3 1.7B [高质量版]"),
         ("sherpa-onnx-qwen3-asr-0.6B-int8", "Qwen3 0.6B [极速版]"),
-        (base_dir, "Qwen3-ASR")
+        (base_dir, "Qwen3-ASR"),
+        ("qwen3-asr-1.7b-int4", "Qwen3 1.7B [高质量版]")
     ]
 
-    selected_dir = None
-    model_version_label = "Qwen3-ASR"
     app_path = get_application_path()
+    selected_components = None
 
     for d_name, v_label in candidate_dirs:
-        check_path = os.path.join(app_path, d_name)
-        if os.path.exists(check_path):
-            selected_dir = check_path
-            model_version_label = v_label
+        model_dir = os.path.join(app_path, d_name)
+        if not os.path.exists(model_dir):
+            continue
+
+        conv_frontend = os.path.join(model_dir, "conv_frontend.onnx")
+        encoder = None
+        for enc_name in ["encoder.int8.onnx", "encoder.int4.onnx", "encoder.onnx"]:
+            p = os.path.join(model_dir, enc_name)
+            if os.path.exists(p):
+                encoder = p
+                break
+
+        decoder = None
+        for dec_name in ["decoder.int8.onnx", "decoder_step.int4.onnx", "decoder.onnx"]:
+            p = os.path.join(model_dir, dec_name)
+            if os.path.exists(p):
+                decoder = p
+                break
+
+        tokenizer_dir = os.path.join(model_dir, "tokenizer")
+        if not os.path.exists(tokenizer_dir):
+            tokenizer_dir = model_dir
+
+        if conv_frontend and os.path.exists(conv_frontend) and encoder and decoder:
+            selected_components = {
+                "model_dir": model_dir,
+                "label": v_label,
+                "conv_frontend": conv_frontend,
+                "encoder": encoder,
+                "decoder": decoder,
+                "tokenizer_dir": tokenizer_dir
+            }
             break
 
-    if selected_dir is None:
-        selected_dir = os.path.join(app_path, MODEL_DIR_NAME)
-
-    model_dir = selected_dir
-    conv_frontend = os.path.join(model_dir, "conv_frontend.onnx")
-    encoder = os.path.join(model_dir, "encoder.int8.onnx")
-    if not os.path.exists(encoder):
-        encoder = os.path.join(model_dir, "encoder.int4.onnx")
-    if not os.path.exists(encoder):
-        encoder = os.path.join(model_dir, "encoder.onnx")
-
-    decoder = os.path.join(model_dir, "decoder.int8.onnx")
-    if not os.path.exists(decoder):
-        decoder = os.path.join(model_dir, "decoder_step.int4.onnx")
-    if not os.path.exists(decoder):
-        decoder = os.path.join(model_dir, "decoder.onnx")
-
-    tokenizer_dir = os.path.join(model_dir, "tokenizer")
-    if not os.path.exists(tokenizer_dir):
-        tokenizer_dir = model_dir
-
-    # 校验必要文件
-    missing = []
-    if not os.path.exists(conv_frontend):
-        missing.append("conv_frontend.onnx")
-    if not os.path.exists(encoder):
-        missing.append("encoder.int8.onnx / encoder.onnx")
-    if not os.path.exists(decoder):
-        missing.append("decoder.int8.onnx / decoder.onnx")
-
-    if missing:
-        print(f"❌ 目录下缺少 Qwen3-ASR 关键模型组件: {', '.join(missing)}")
-        print(f"请检查路径: {model_dir}")
+    if selected_components is None:
+        print("❌ 未能在当前环境中检测到完整的 Qwen3-ASR 模型组件。")
+        print(f"请检查模型存放路径: {os.path.join(app_path, MODEL_DIR_NAME)}")
         return None
+
+    model_dir = selected_components["model_dir"]
+    model_version_label = selected_components["label"]
+    conv_frontend = selected_components["conv_frontend"]
+    encoder = selected_components["encoder"]
+    decoder = selected_components["decoder"]
+    tokenizer_dir = selected_components["tokenizer_dir"]
 
     # 检测并配置运行硬件提供方（Execution Provider）
     has_gpu, gpu_info, dev_type = check_hardware_accelerator()
