@@ -31,10 +31,8 @@ MODEL_DIR_NAME = "sherpa-onnx-qwen3-asr-0.6B-int8"
 # 加速后端模式：可选 "gpu"（优先Intel Arc GPU加速，推荐）、"cpu"（纯CPU运算）、"npu"（实验性NPU）
 ACCELERATOR_BACKEND = "gpu"
 
-# 推荐首选快捷键：F8（纯功能键，绝无字符污染，单键极速触发）
+# 全局唯一热键：F8（纯功能键，绝无字符污染，单键极速触发）
 HOTKEY = "f8"
-HOTKEY_DISPLAY = "F8 / Win+Shift+H"
-EXIT_HOTKEY = "ctrl+shift+q"
 
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
@@ -131,32 +129,7 @@ def toggle_recording():
     is_recording = not is_recording
     print(f"DEBUG: 录音开关状态 -> {is_recording}")
 
-def ensure_win_h_disabled():
-    # 自动在当前用户注册表中写入 DisabledHotkeys='H'，从根源切断 Windows Explorer 响应 Win+H
-    try:
-        import winreg
-        reg_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_ALL_ACCESS) as key:
-            try:
-                val, _ = winreg.QueryValueEx(key, "DisabledHotkeys")
-            except FileNotFoundError:
-                val = ""
-            if "H" not in val:
-                new_val = val + "H"
-                winreg.SetValueEx(key, "DisabledHotkeys", 0, winreg.REG_SZ, new_val)
-                # 广播设置变更消息，通知系统 Shell 刷新热键规则
-                HWND_BROADCAST = 0xFFFF
-                WM_SETTINGCHANGE = 0x001A
-                ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "TraySettings", 2, 2000, ctypes.byref(ctypes.c_ulong()))
-                print("🔒 已在系统注册表中成功禁用 Win+H 默认绑定！")
-    except Exception as e:
-        print(f"⚠️ 配置系统热键屏蔽项提示: {e}")
-
 pynput_listener = None
-h_suppressed = False
-win_pressed = False
-shift_pressed = False
-suppress_next_win_up = False
 
 def log_debug(message):
     try:
@@ -168,26 +141,17 @@ def log_debug(message):
         pass
 
 def win32_event_filter(msg, data):
-    # 底层键盘钩子：支持 F8 单键极速响应（不输入任何字符），同时全面兼容 Win + Shift + H
+    # 底层键盘钩子：全局唯一保留 F8 功能键，绝无字符污染，单键切换录音/结束，拦截吞掉按键
     try:
-        global h_suppressed, win_pressed, shift_pressed, suppress_next_win_up
         WM_KEYDOWN = 0x0100
         WM_KEYUP = 0x0101
         WM_SYSKEYDOWN = 0x0104
         WM_SYSKEYUP = 0x0105
 
         VK_F8 = 0x77
-        VK_LWIN = 0x5B
-        VK_RWIN = 0x5C
-        VK_SHIFT = 0x10
-        VK_LSHIFT = 0xA0
-        VK_RSHIFT = 0xA1
-        VK_H = 0x48
-        VK_DUMMY = 0xFF
-
         vk_code = data.vkCode
 
-        # 1. 优先响应 F8 功能键：绝无字符污染，单键切换录音/结束，吞掉按键防止触发应用程序默认快捷键
+        # 仅响应 F8 功能键：按下一键切换录音状态，并吞掉按键避免触发宿主软件快捷键
         if vk_code == VK_F8:
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 log_debug("F8 命中，切换录音状态")
@@ -196,46 +160,9 @@ def win32_event_filter(msg, data):
             elif msg in (WM_KEYUP, WM_SYSKEYUP):
                 return False
 
-        # 2. 监听 Win 键状态
-        if vk_code in (VK_LWIN, VK_RWIN):
-            if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                win_pressed = True
-            elif msg in (WM_KEYUP, WM_SYSKEYUP):
-                win_pressed = False
-                h_suppressed = False
-                if suppress_next_win_up:
-                    suppress_next_win_up = False
-                    return False
-
-        # 3. 监听 Shift 键状态
-        if vk_code in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT):
-            if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                shift_pressed = True
-            elif msg in (WM_KEYUP, WM_SYSKEYUP):
-                shift_pressed = False
-
-        # 4. 捕获 H 键：同时使用状态变量与系统底层实时状态进行双重校验
-        if vk_code == VK_H:
-            is_win_down = win_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_LWIN) & 0x8000) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_RWIN) & 0x8000)
-            is_shift_down = shift_pressed or bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
-
-            if is_win_down and is_shift_down:
-                if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    if not h_suppressed:
-                        h_suppressed = True
-                        suppress_next_win_up = True
-                        # 注入虚拟按键中和 Win 状态
-                        ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 0, 0)
-                        ctypes.windll.user32.keybd_event(VK_DUMMY, 0, 2, 0)
-                        log_debug("Win+Shift+H 命中，切换录音状态")
-                        toggle_recording()
-                    return False
-                elif msg in (WM_KEYUP, WM_SYSKEYUP):
-                    return False
-
         return True
     except Exception as e:
-        # 绝不让钩子中的任何意外导致主程序闪退
+        # 异常容错保护，避免底层钩子抛错导致程序闪退
         return True
 
 def show_model_missing_dialog(target_dir):
@@ -382,14 +309,10 @@ def background_task():
         pass
     log_debug("=== Qwen3-ASR Keyboard Listener Started ===")
 
-    # 启动时确保系统注册表已屏蔽 Win+H 默认唤起行为
-    ensure_win_h_disabled()
-
     global pynput_listener
     pynput_listener = pynput_keyboard.Listener(win32_event_filter=win32_event_filter)
     pynput_listener.start()
 
-    keyboard.add_hotkey(EXIT_HOTKEY, lambda: os._exit(0))
     mic_device_idx = find_mic_device()
 
     app_path = get_application_path()
@@ -401,8 +324,7 @@ def background_task():
         print(f"💡 请将下载好的模型解压到: {model_dir}\n")
 
     print("👉 单击桌面【悬浮小条】或按下【F8】键开启录音，再次单击立即识别上屏。")
-    print("💡 (注: 同时也完全兼容 Win+Shift+H 组合热键)")
-    print(f"👉 按下【{EXIT_HOTKEY}】或通过托盘菜单安全退出。")
+    print("👉 可通过系统托盘菜单或悬浮条右键选择安全退出。")
     winsound.Beep(600, 200)
 
     while True:
