@@ -36,11 +36,34 @@ from PyQt5.QtCore import Qt, QTimer, QRectF, QPoint, pyqtSignal, QThread
 # ==============================================================================
 class AppConfig:
     """应用全局配置常量"""
-    # 默认语音识别模型目录（首选 0.6B INT8 轻量极速版）
-    DEFAULT_MODEL_DIR = "sherpa-onnx-qwen3-asr-0.6B-int8"
+    # 预设支持的模型清单与特征定义
+    MODELS = {
+        "0.6b": {
+            "key": "0.6b",
+            "name": "Qwen3 0.6B [极速版 - 推荐]",
+            "short_name": "0.6B 极速版",
+            "candidate_dirs": [
+                "sherpa-onnx-qwen3-asr-0.6B-int8",
+            ],
+            "allow_realtime_preview": True,
+            "description": "极速响应（100~200ms），内存开销低（约700MB），适合日常高频语音打字与代码辅助",
+        },
+        "1.7b": {
+            "key": "1.7b",
+            "name": "Qwen3 1.7B [高质量版]",
+            "short_name": "1.7B 高质量版",
+            "candidate_dirs": [
+                "sherpa-onnx-qwen3-asr-1.7B-int8",
+                "qwen3-asr-1.7b-int8",
+                "qwen3-asr-1.7b-int4",
+            ],
+            "allow_realtime_preview": False,
+            "description": "高精度大模型，适合长句/复杂专有名词；录音期间不进行阻塞推理解码，保证 100% 不丢音频",
+        },
+    }
 
-    # 加速硬件模式："gpu"（优先检测独立/核显显卡）、"cpu"（纯CPU计算）
-    ACCELERATOR_BACKEND = "gpu"
+    # 默认选中的模型版本（优先极速版）
+    DEFAULT_MODEL_KEY = "0.6b"
 
     # 音频流参数配置：16kHz 单声道 16bit 是 ASR 模型的标准输入要求
     SAMPLE_RATE = 16000
@@ -55,6 +78,18 @@ class AppConfig:
     # 悬浮胶囊尺寸定义
     BAR_WIDTH = 330
     BAR_HEIGHT = 44
+
+    @staticmethod
+    def get_optimal_threads() -> int:
+        """根据当前系统 CPU 逻辑核心数自适应分配最强并行推理线程数"""
+        count = os.cpu_count() or 4
+        if count >= 12:
+            return 8
+        elif count >= 8:
+            return 6
+        elif count >= 4:
+            return 4
+        return max(1, count)
 
     # UI 配色主题方案
     THEMES = {
@@ -172,36 +207,15 @@ Win32Utils.setup_console_encoding()
 # 3. 硬件设备探测与管理
 # ==============================================================================
 class HardwareManager:
-    """管理麦克风与硬件加速探测"""
+    """管理麦克风与硬件计算能力探测"""
 
     @staticmethod
-    def check_accelerator() -> Tuple[bool, str, str]:
-        """优先探测 OpenVINO 及系统 GPU 加速支持状态"""
-        # 1. 检测 OpenVINO GPU 设备支持
-        try:
-            import openvino as ov
-            core = ov.Core()
-            if "GPU" in core.available_devices:
-                gpu_name = core.get_property("GPU", "FULL_DEVICE_NAME")
-                return True, gpu_name, "gpu"
-        except Exception:
-            pass
-
-        # 2. 备用检测：查询 Windows CIM 显示适配器
-        try:
-            import subprocess
-            cmd = "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"
-            res = subprocess.check_output(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                text=True,
-                errors="ignore"
-            ).strip()
-            if res:
-                return True, res.splitlines()[0].strip(), "gpu"
-        except Exception:
-            pass
-
-        return False, "CPU 基础计算模式", "cpu"
+    def check_compute_backend() -> Tuple[str, str, int]:
+        """探测真实的计算硬件与自适应多核并发配置"""
+        cpu_cores = os.cpu_count() or 4
+        optimal_threads = AppConfig.get_optimal_threads()
+        desc = f"CPU 多核加速 ({optimal_threads}/{cpu_cores}核)"
+        return desc, "cpu", optimal_threads
 
     @staticmethod
     def find_mic_device(pyaudio_instance: pyaudio.PyAudio) -> Optional[int]:
@@ -234,7 +248,7 @@ class HardwareManager:
 # 4. ASR 模型组件加载器
 # ==============================================================================
 class ModelLoader:
-    """Qwen3-ASR 模型探测与引擎初始化"""
+    """Qwen3-ASR 多模型动态探测与引擎初始化"""
 
     @classmethod
     def get_candidate_roots(cls) -> list:
@@ -259,19 +273,14 @@ class ModelLoader:
         return roots
 
     @classmethod
-    def locate_components(cls) -> Optional[Dict[str, str]]:
-        """智能寻找并定位完整的 Qwen3-ASR 模型文件组"""
-        # 优先探测 1.7B 旗舰高质量模型，若未部署则平滑回退至 0.6B 极速版
-        candidate_specs = [
-            ("sherpa-onnx-qwen3-asr-1.7B-int8", "Qwen3 1.7B [高质量版]"),
-            ("qwen3-asr-1.7b-int8", "Qwen3 1.7B [高质量版]"),
-            ("qwen3-asr-1.7b-int4", "Qwen3 1.7B [高质量版]"),
-            ("sherpa-onnx-qwen3-asr-0.6B-int8", "Qwen3 0.6B [极速版]"),
-            (AppConfig.DEFAULT_MODEL_DIR, "Qwen3-ASR"),
-        ]
+    def locate_model_components(cls, model_key: str) -> Optional[Dict[str, Any]]:
+        """智能寻找并定位指定模型 key (如 '0.6b' 或 '1.7b') 的模型文件组"""
+        model_meta = AppConfig.MODELS.get(model_key)
+        if not model_meta:
+            return None
 
         for root in cls.get_candidate_roots():
-            for folder_name, label in candidate_specs:
+            for folder_name in model_meta["candidate_dirs"]:
                 model_dir = os.path.join(root, folder_name) if not os.path.isabs(folder_name) else folder_name
                 if not os.path.exists(model_dir):
                     continue
@@ -300,14 +309,27 @@ class ModelLoader:
 
                 if encoder and decoder:
                     return {
+                        "key": model_key,
                         "model_dir": model_dir,
-                        "label": label,
+                        "name": model_meta["name"],
+                        "short_name": model_meta["short_name"],
+                        "allow_realtime_preview": model_meta["allow_realtime_preview"],
                         "conv_frontend": conv_frontend,
                         "encoder": encoder,
                         "decoder": decoder,
                         "tokenizer": tokenizer_dir,
                     }
         return None
+
+    @classmethod
+    def get_available_models(cls) -> Dict[str, Dict[str, Any]]:
+        """获取本地磁盘上所有已安装且推理组件齐全的模型"""
+        available = {}
+        for key in AppConfig.MODELS:
+            comps = cls.locate_model_components(key)
+            if comps:
+                available[key] = comps
+        return available
 
     @classmethod
     def show_missing_dialog(cls, target_dir: str):
@@ -328,27 +350,23 @@ class ModelLoader:
             pass
 
     @classmethod
-    def load_recognizer(cls) -> Tuple[Optional[sherpa_onnx.OfflineRecognizer], str]:
-        """初始化离线识别引擎"""
-        components = cls.locate_components()
-        if not components:
+    def load_recognizer(cls, preferred_key: str = "0.6b") -> Tuple[Optional[sherpa_onnx.OfflineRecognizer], str, str]:
+        """初始化离线识别引擎。返回: (recognizer, backend_label, active_model_key)"""
+        available = cls.get_available_models()
+        if not available:
             app_dir = Win32Utils.get_app_dir()
-            print("❌ 未能在当前环境中检测到完整的 Qwen3-ASR 模型组件。")
+            print("❌ 未能在当前环境中检测到任何可用的 Qwen3-ASR 模型组件。")
             cls.show_missing_dialog(app_dir)
-            return None, "未找到可用模型"
+            return None, "未找到可用模型", preferred_key
 
-        has_gpu, gpu_info, _ = HardwareManager.check_accelerator()
-        print(f"💻 硬件设备扫描: {gpu_info}")
+        # 若指定模型存在则使用，否则平滑 fallback 到存在的第一个
+        active_key = preferred_key if preferred_key in available else next(iter(available.keys()))
+        components = available[active_key]
 
-        model_label = components["label"]
-        provider = "cpu"
-        if AppConfig.ACCELERATOR_BACKEND.lower() in ("gpu", "auto") and has_gpu:
-            backend_label = f"{model_label} | Intel Arc GPU (8GB)"
-            print(f"🚀 已激活硬件加速模式: {gpu_info}")
-        else:
-            backend_label = f"{model_label} | CPU 多核优化"
+        backend_desc, provider, num_threads = HardwareManager.check_compute_backend()
+        backend_label = f"{components['short_name']} | {backend_desc}"
 
-        print(f"🔄 正在初始化 {model_label} 离线识别引擎...")
+        print(f"🔄 正在初始化 {components['name']} 离线识别引擎...")
         print(f"  - 特征提取前端: {os.path.basename(components['conv_frontend'])}")
         print(f"  - 编码器: {os.path.basename(components['encoder'])}")
         print(f"  - 解码器: {os.path.basename(components['decoder'])}")
@@ -360,15 +378,15 @@ class ModelLoader:
             encoder=components["encoder"],
             decoder=components["decoder"],
             tokenizer=components["tokenizer"],
-            num_threads=4,
+            num_threads=num_threads,
             decoding_method="greedy_search",
             debug=False,
             provider=provider,
             max_total_len=512,
             max_new_tokens=128
         )
-        print("✅ Qwen3-ASR 模型加载成功！\n")
-        return recognizer, backend_label
+        print(f"✅ {components['name']} 加载成功！\n")
+        return recognizer, backend_label, active_key
 
 
 # ==============================================================================
@@ -380,7 +398,7 @@ class AsrWorker(QThread):
     sig_recording_stopped = pyqtSignal()
     sig_realtime_text = pyqtSignal(str)
     sig_banner_update = pyqtSignal(str, float)  # 文本，持续显示秒数
-    sig_model_loaded = pyqtSignal(str)  # 模型与硬件加速信息就绪通知
+    sig_model_loaded = pyqtSignal(str, str)  # 激活的模型 key, 完整状态标签
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -388,6 +406,7 @@ class AsrWorker(QThread):
         self.is_recording = False
         self.recording_start_time = 0.0
 
+        self.current_model_key = AppConfig.DEFAULT_MODEL_KEY
         self.recognizer: Optional[sherpa_onnx.OfflineRecognizer] = None
         self.backend_label = "初始化中..."
 
@@ -396,13 +415,15 @@ class AsrWorker(QThread):
         self.mic_index: Optional[int] = None
         self.target_window_hwnd: Optional[int] = None
 
-        # 录音状态切换请求事件
+        # 录音状态切换请求事件与模型切换请求
         self._toggle_requested = threading.Event()
+        self._switch_model_requested = threading.Event()
+        self._target_model_key: str = ""
 
     def initialize_engine(self):
         """初始化麦克风和 ASR 识别引擎"""
         self.mic_index = HardwareManager.find_mic_device(self.pyaudio_instance)
-        self.recognizer, self.backend_label = ModelLoader.load_recognizer()
+        self.recognizer, self.backend_label, self.current_model_key = ModelLoader.load_recognizer(self.current_model_key)
 
     def toggle_recording(self):
         """触发录音启停切换"""
@@ -410,6 +431,42 @@ class AsrWorker(QThread):
         if not self.is_recording:
             self.target_window_hwnd = Win32Utils.get_foreground_window()
         self._toggle_requested.set()
+
+    def request_switch_model(self, model_key: str):
+        """请求切换 ASR 模型版本（线程安全调度）"""
+        if self.is_recording:
+            self.sig_banner_update.emit("⚠️ 录音中请稍后再切换模型", 1.5)
+            return
+        if model_key == self.current_model_key:
+            return
+        self._target_model_key = model_key
+        self._switch_model_requested.set()
+        self._toggle_requested.set()
+
+    def _do_switch_model(self, target_key: str):
+        """在工作线程内部执行平滑模型销毁与重建"""
+        if not target_key or target_key == self.current_model_key:
+            return
+        target_meta = AppConfig.MODELS.get(target_key, {})
+        target_name = target_meta.get("short_name", target_key)
+        print(f"\n🔄 [模型热切换] 正在平滑卸载当前模型并加载: {target_name} ...")
+        self.sig_banner_update.emit(f"🔄 正在加载 {target_name}...", 8.0)
+
+        # 释放旧模型与垃圾回收
+        self.recognizer = None
+        gc.collect()
+
+        rec, label, active_key = ModelLoader.load_recognizer(target_key)
+        if rec:
+            self.recognizer = rec
+            self.backend_label = label
+            self.current_model_key = active_key
+            self.sig_model_loaded.emit(self.current_model_key, self.backend_label)
+            self.sig_banner_update.emit(f"✅ 已启用 {target_name}", 2.0)
+            winsound.Beep(800, 150)
+            print(f"🎉 [模型热切换完成] 当前激活: {self.backend_label}\n")
+        else:
+            self.sig_banner_update.emit(f"❌ 加载 {target_name} 失败", 2.0)
 
     def stop_worker(self):
         """安全停止工作线程并清理资源"""
@@ -424,17 +481,23 @@ class AsrWorker(QThread):
     def run(self):
         """后台主循环"""
         self.initialize_engine()
-        self.sig_model_loaded.emit(self.backend_label)
+        self.sig_model_loaded.emit(self.current_model_key, self.backend_label)
         winsound.Beep(600, 200)
 
         print("👉 单击桌面【悬浮小条】或轻按键盘【F8】键开始录音，再次单击立即识别上屏。")
-        print("👉 可通过系统托盘菜单或悬浮条右键选择安全退出。\n")
+        print("👉 可通过系统托盘菜单或悬浮条右键随时切换 0.6B 极速版 / 1.7B 高质量版。\n")
 
         while self.running:
-            # 等待录音触发
+            # 等待录音触发或模型切换信号
             self._toggle_requested.wait(timeout=0.1)
             if not self.running:
                 break
+
+            # 处理模型热切换请求
+            if self._switch_model_requested.is_set():
+                self._switch_model_requested.clear()
+                self._do_switch_model(self._target_model_key)
+                continue
 
             if self._toggle_requested.is_set():
                 self._toggle_requested.clear()
@@ -464,7 +527,11 @@ class AsrWorker(QThread):
             self.sig_banner_update.emit("⚠️ 麦克风打开失败", 2.0)
             return
 
-        self.sig_realtime_text.emit("🎤 Qwen3 正在聆听...")
+        model_meta = AppConfig.MODELS.get(self.current_model_key, {})
+        allow_preview = model_meta.get("allow_realtime_preview", True)
+
+        prompt_text = "🎤 Qwen3 正在聆听..." if allow_preview else "🎤 Qwen3 正在高品质采集..."
+        self.sig_realtime_text.emit(prompt_text)
         frames = []
         last_infer_time = time.time()
         mute_warned = False
@@ -486,27 +553,42 @@ class AsrWorker(QThread):
             except Exception:
                 continue
 
-            # 每隔 0.5 秒进行一次轻量伪实时预览解码
             now = time.time()
-            if self.recognizer and (now - last_infer_time > 0.5) and len(frames) > 6:
-                raw_tmp = b"".join(frames)
-                audio_tmp = np.frombuffer(raw_tmp, dtype=np.int16).astype(np.float32) / 32768.0
-                rms = float(np.sqrt(np.mean(audio_tmp ** 2)))
-
-                if rms < 0.001:
-                    if not mute_warned:
-                        self.sig_realtime_text.emit("⚠️ 麦克风输入信号微弱")
-                        mute_warned = True
+            if not allow_preview:
+                # 针对 1.7B 等高质量大模型：绝对不在此处进行推理解码，专职采样避免缓冲区溢出丢音
+                if (now - last_infer_time > 0.3) and len(frames) > 5:
+                    raw_recent = b"".join(frames[-5:])
+                    audio_recent = np.frombuffer(raw_recent, dtype=np.int16).astype(np.float32) / 32768.0
+                    rms = float(np.sqrt(np.mean(audio_recent ** 2)))
+                    if rms < 0.001:
+                        if not mute_warned:
+                            self.sig_realtime_text.emit("⚠️ 麦克风输入信号微弱")
+                            mute_warned = True
+                    else:
+                        mute_warned = False
+                        self.sig_realtime_text.emit("🎤 Qwen3 正在高品质采集...")
                     last_infer_time = now
-                    continue
+            else:
+                # 针对 0.6B 轻量模型：每隔 0.6 秒进行一次轻量实时预览
+                if self.recognizer and (now - last_infer_time > 0.6) and len(frames) > 8:
+                    raw_tmp = b"".join(frames)
+                    audio_tmp = np.frombuffer(raw_tmp, dtype=np.int16).astype(np.float32) / 32768.0
+                    rms = float(np.sqrt(np.mean(audio_tmp ** 2)))
 
-                mute_warned = False
-                c_stream = self.recognizer.create_stream()
-                c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_tmp)
-                self.recognizer.decode_stream(c_stream)
-                if c_stream.result.text:
-                    self.sig_realtime_text.emit(c_stream.result.text)
-                last_infer_time = now
+                    if rms < 0.001:
+                        if not mute_warned:
+                            self.sig_realtime_text.emit("⚠️ 麦克风输入信号微弱")
+                            mute_warned = True
+                        last_infer_time = now
+                        continue
+
+                    mute_warned = False
+                    c_stream = self.recognizer.create_stream()
+                    c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_tmp)
+                    self.recognizer.decode_stream(c_stream)
+                    if c_stream.result.text:
+                        self.sig_realtime_text.emit(c_stream.result.text)
+                    last_infer_time = now
 
         self.is_recording = False
         self.sig_recording_stopped.emit()
@@ -529,7 +611,9 @@ class AsrWorker(QThread):
             self.sig_realtime_text.emit("")
             return
 
-        self.sig_banner_update.emit("⚡ 正在极速识别...", 5.0)
+        model_meta = AppConfig.MODELS.get(self.current_model_key, {})
+        tag = model_meta.get("short_name", "Qwen3")
+        self.sig_banner_update.emit(f"⚡ 正在识别 ({tag})...", 8.0)
 
         raw_data = b"".join(frames)
         audio_int16 = np.frombuffer(raw_data, dtype=np.int16)
@@ -537,7 +621,7 @@ class AsrWorker(QThread):
         rms_final = float(np.sqrt(np.mean(audio_float32 ** 2)))
 
         duration = len(frames) * AppConfig.CHUNK_SIZE / AppConfig.SAMPLE_RATE
-        print(f"🔍 采集完成: 时长 {duration:.1f}s, RMS 响度 {rms_final:.4f}")
+        print(f"🔍 采集完成: 时长 {duration:.1f}s, RMS 响度 {rms_final:.4f} [使用模型: {tag}]")
 
         if rms_final <= 0.001:
             self.sig_banner_update.emit("⚠️ 麦克风无声音信号", 1.5)
@@ -674,8 +758,9 @@ class FloatingBarUI(QWidget):
         self.worker.sig_banner_update.connect(self._on_banner_update)
         self.worker.sig_model_loaded.connect(self._on_model_loaded)
 
-    def _on_model_loaded(self, label: str):
+    def _on_model_loaded(self, model_key: str, label: str):
         self.model_info = label
+        self.update()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -721,9 +806,28 @@ class FloatingBarUI(QWidget):
         """弹出悬浮条右键功能菜单"""
         menu = QMenu(self)
 
-        act_model = QAction(f"🤖 {self.model_info}", menu)
+        act_model = QAction(f"🤖 当前: {self.model_info}", menu)
         act_model.setEnabled(False)
         menu.addAction(act_model)
+
+        # 动态创建切换模型子菜单
+        sub_models = menu.addMenu("🔄 切换识别模型")
+        available_models = ModelLoader.get_available_models()
+        current_key = getattr(self.worker, "current_model_key", "")
+        for key, meta in AppConfig.MODELS.items():
+            is_installed = key in available_models
+            is_active = (key == current_key)
+
+            icon_tag = "● " if is_active else ("○ " if is_installed else "✕ ")
+            title = f"{icon_tag}{meta['name']}"
+            if not is_installed:
+                title += " (未下载)"
+
+            act = QAction(title, sub_models)
+            act.setEnabled(is_installed and not is_active)
+            act.triggered.connect(lambda checked=False, k=key: self.worker.request_switch_model(k))
+            sub_models.addAction(act)
+
         menu.addSeparator()
 
         act_theme = QAction("🎨 切换主题 (明亮/暗黑)", menu)
@@ -883,38 +987,62 @@ class TrayManager:
         self.tray.setIcon(QIcon(pix))
         self.tray.setToolTip("VibeC 语音助手 (Qwen3-ASR)")
 
-        menu = QMenu()
+        self.menu = QMenu()
 
-        self.act_model_info = QAction("🤖 正在检测模型...", menu)
+        self.act_model_info = QAction("🤖 正在检测模型...", self.menu)
         self.act_model_info.setEnabled(False)
-        menu.addAction(self.act_model_info)
-        menu.addSeparator()
+        self.menu.addAction(self.act_model_info)
 
-        act_toggle = QAction("👁️ 显示/隐藏悬浮条", menu)
+        # 模型切换子菜单
+        self.sub_models = self.menu.addMenu("🔄 切换识别模型")
+        self._rebuild_model_submenu()
+
+        self.menu.addSeparator()
+
+        act_toggle = QAction("👁️ 显示/隐藏悬浮条", self.menu)
         act_toggle.triggered.connect(self._toggle_bar_visibility)
-        menu.addAction(act_toggle)
+        self.menu.addAction(act_toggle)
 
-        act_info = QAction("📝 使用说明", menu)
+        act_info = QAction("📝 使用说明", self.menu)
         act_info.triggered.connect(self._show_info_dialog)
-        menu.addAction(act_info)
+        self.menu.addAction(act_info)
 
-        act_theme = QAction("🎨 切换主题", menu)
+        act_theme = QAction("🎨 切换主题", self.menu)
         act_theme.triggered.connect(self.floating_bar.toggle_theme)
-        menu.addAction(act_theme)
+        self.menu.addAction(act_theme)
 
-        menu.addSeparator()
-        act_exit = QAction("❌ 完全退出", menu)
+        self.menu.addSeparator()
+        act_exit = QAction("❌ 完全退出", self.menu)
         act_exit.triggered.connect(self._exit_app)
-        menu.addAction(act_exit)
+        self.menu.addAction(act_exit)
 
-        self.tray.setContextMenu(menu)
+        self.tray.setContextMenu(self.menu)
         self.tray.show()
 
-    def update_model_info(self, backend_label: str):
+    def _rebuild_model_submenu(self):
+        """重新构建托盘中的模型切换菜单"""
+        self.sub_models.clear()
+        available_models = ModelLoader.get_available_models()
+        current_key = getattr(self.floating_bar.worker, "current_model_key", "")
+        for key, meta in AppConfig.MODELS.items():
+            is_installed = key in available_models
+            is_active = (key == current_key)
+            icon_tag = "● " if is_active else ("○ " if is_installed else "✕ ")
+            title = f"{icon_tag}{meta['name']}"
+            if not is_installed:
+                title += " (未下载)"
+
+            act = QAction(title, self.sub_models)
+            act.setEnabled(is_installed and not is_active)
+            act.triggered.connect(lambda checked=False, k=key: self.floating_bar.worker.request_switch_model(k))
+            self.sub_models.addAction(act)
+
+    def update_model_info(self, model_key: str, backend_label: str):
         """动态更新托盘提示文本与菜单信息"""
         self.tray.setToolTip(f"VibeC 语音助手\n{backend_label}")
         if hasattr(self, "act_model_info"):
             self.act_model_info.setText(f"🤖 {backend_label}")
+        self._rebuild_model_submenu()
 
     def _toggle_bar_visibility(self):
         if self.floating_bar.isVisible():
@@ -930,8 +1058,8 @@ class TrayManager:
             "1. 鼠标单击【悬浮小条】或按键盘【F8】键开始录音\n"
             "2. 讲话完毕后再次点击悬浮小条或按【F8】，自动文字上屏\n"
             "3. 鼠标可随意按住悬浮小条拖拽到屏幕任意习惯位置\n"
-            "4. 右键单击悬浮小条可切换暗黑/明亮主题或一键居中\n"
-            "5. 右键任务栏右下角托盘图标可安全退出程序"
+            "4. 右键单击悬浮小条可【切换 0.6B/1.7B 模型】或主题\n"
+            "5. 右键任务栏右下角托盘图标也可随时切换模型与退出"
         )
 
     def _exit_app(self):
