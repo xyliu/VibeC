@@ -164,6 +164,9 @@ class Win32Utils:
         except Exception as e:
             print(f"⚠️ 模拟键盘键入异常: {e}")
 
+# 在模块加载之初立即初始化控制台 UTF-8 编码，杜绝 Windows GBK 环境下打印 Emoji 异常崩溃
+Win32Utils.setup_console_encoding()
+
 
 # ==============================================================================
 # 3. 硬件设备探测与管理
@@ -258,10 +261,13 @@ class ModelLoader:
     @classmethod
     def locate_components(cls) -> Optional[Dict[str, str]]:
         """智能寻找并定位完整的 Qwen3-ASR 模型文件组"""
+        # 优先探测 1.7B 旗舰高质量模型，若未部署则平滑回退至 0.6B 极速版
         candidate_specs = [
+            ("sherpa-onnx-qwen3-asr-1.7B-int8", "Qwen3 1.7B [高质量版]"),
+            ("qwen3-asr-1.7b-int8", "Qwen3 1.7B [高质量版]"),
+            ("qwen3-asr-1.7b-int4", "Qwen3 1.7B [高质量版]"),
             ("sherpa-onnx-qwen3-asr-0.6B-int8", "Qwen3 0.6B [极速版]"),
             (AppConfig.DEFAULT_MODEL_DIR, "Qwen3-ASR"),
-            ("qwen3-asr-1.7b-int4", "Qwen3 1.7B [高质量版]")
         ]
 
         for root in cls.get_candidate_roots():
@@ -374,6 +380,7 @@ class AsrWorker(QThread):
     sig_recording_stopped = pyqtSignal()
     sig_realtime_text = pyqtSignal(str)
     sig_banner_update = pyqtSignal(str, float)  # 文本，持续显示秒数
+    sig_model_loaded = pyqtSignal(str)  # 模型与硬件加速信息就绪通知
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -417,6 +424,7 @@ class AsrWorker(QThread):
     def run(self):
         """后台主循环"""
         self.initialize_engine()
+        self.sig_model_loaded.emit(self.backend_label)
         winsound.Beep(600, 200)
 
         print("👉 单击桌面【悬浮小条】或轻按键盘【F8】键开始录音，再次单击立即识别上屏。")
@@ -624,6 +632,7 @@ class FloatingBarUI(QWidget):
         self.drag_start_pos: Optional[QPoint] = None
         self.is_dragging = False
         self.is_hovered = False
+        self.model_info = "模型加载中..."
 
         self._init_window_flags()
         self._init_geometry()
@@ -663,6 +672,10 @@ class FloatingBarUI(QWidget):
         self.worker.sig_recording_stopped.connect(self._on_recording_stopped)
         self.worker.sig_realtime_text.connect(self._on_realtime_text)
         self.worker.sig_banner_update.connect(self._on_banner_update)
+        self.worker.sig_model_loaded.connect(self._on_model_loaded)
+
+    def _on_model_loaded(self, label: str):
+        self.model_info = label
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -707,6 +720,11 @@ class FloatingBarUI(QWidget):
     def _show_context_menu(self, global_pos: QPoint):
         """弹出悬浮条右键功能菜单"""
         menu = QMenu(self)
+
+        act_model = QAction(f"🤖 {self.model_info}", menu)
+        act_model.setEnabled(False)
+        menu.addAction(act_model)
+        menu.addSeparator()
 
         act_theme = QAction("🎨 切换主题 (明亮/暗黑)", menu)
         act_theme.triggered.connect(self.toggle_theme)
@@ -867,6 +885,11 @@ class TrayManager:
 
         menu = QMenu()
 
+        self.act_model_info = QAction("🤖 正在检测模型...", menu)
+        self.act_model_info.setEnabled(False)
+        menu.addAction(self.act_model_info)
+        menu.addSeparator()
+
         act_toggle = QAction("👁️ 显示/隐藏悬浮条", menu)
         act_toggle.triggered.connect(self._toggle_bar_visibility)
         menu.addAction(act_toggle)
@@ -886,6 +909,12 @@ class TrayManager:
 
         self.tray.setContextMenu(menu)
         self.tray.show()
+
+    def update_model_info(self, backend_label: str):
+        """动态更新托盘提示文本与菜单信息"""
+        self.tray.setToolTip(f"VibeC 语音助手\n{backend_label}")
+        if hasattr(self, "act_model_info"):
+            self.act_model_info.setText(f"🤖 {backend_label}")
 
     def _toggle_bar_visibility(self):
         if self.floating_bar.isVisible():
@@ -927,6 +956,7 @@ def main():
     # 4. 创建置顶悬浮小条与托盘图标
     floating_bar = FloatingBarUI(worker)
     tray = TrayManager(app, floating_bar)
+    worker.sig_model_loaded.connect(tray.update_model_info)
 
     # 5. 启动全局 F8 热键底层监听
     hotkey = GlobalHotkeyHook(on_trigger_callback=worker.toggle_recording)

@@ -39,19 +39,24 @@ def main():
 
     print(f"\n✅ EXE 打包成功！发布目录: {target_dist_dir}")
 
-    # 3. 自动拷贝 Qwen3-ASR 模型文件夹至 exe 同级目录下
-    model_name = "sherpa-onnx-qwen3-asr-0.6B-int8"
-    src_model_dir = os.path.join(project_root, model_name)
-    dst_model_dir = os.path.join(target_dist_dir, model_name)
+    # 3. 自动拷贝 Qwen3-ASR 模型文件夹至 exe 同级目录下 (优先选用 1.7B 旗舰版)
+    candidate_models = ["sherpa-onnx-qwen3-asr-1.7B-int8", "sherpa-onnx-qwen3-asr-0.6B-int8"]
+    model_name = None
+    for m in candidate_models:
+        if os.path.exists(os.path.join(project_root, m)):
+            model_name = m
+            break
 
-    if os.path.exists(src_model_dir):
+    if model_name:
+        src_model_dir = os.path.join(project_root, model_name)
+        dst_model_dir = os.path.join(target_dist_dir, model_name)
         print(f"🔄 正在自动将模型文件夹部署到发布目录:\n   从: {src_model_dir}\n   到: {dst_model_dir}")
         if os.path.exists(dst_model_dir):
             shutil.rmtree(dst_model_dir)
         shutil.copytree(src_model_dir, dst_model_dir)
-        print("🎉 模型文件夹自动部署完毕！")
+        print(f"🎉 模型文件夹 [{model_name}] 自动部署完毕！")
     else:
-        print(f"⚠️ 项目根目录未检测到 {model_name}，请先运行 python download_qwen3_asr.py 下载模型。")
+        print("⚠️ 项目根目录未检测到有效模型文件夹，请先运行模型下载脚本。")
 
     print("\n" + "=" * 60)
     print("✨ 全部打包与部署工作完成！")
