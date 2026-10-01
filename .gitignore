@@ -32,3 +32,4 @@ whisper-*/
 venv/
 .vscode/
 .idea/
+.cache_ov/

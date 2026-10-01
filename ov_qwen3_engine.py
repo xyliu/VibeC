@@ -42,6 +42,15 @@ class OpenVinoQwen3Recognizer:
         self.num_threads = num_threads
         
         self.core = ov.Core()
+        
+        # 启用编译磁盘缓存，避免每次切换或启动时长时间重新编译 GPU Kernel
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache_ov")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            self.core.set_property({"CACHE_DIR": cache_dir})
+        except Exception:
+            pass
+
         if "CPU" in [device_encoder, device_decoder]:
             self.core.set_property("CPU", {"INFERENCE_NUM_THREADS": num_threads})
 
@@ -117,8 +126,17 @@ class OpenVinoQwen3Recognizer:
         input_features = feat_res.input_features.transpose(0, 2, 1)
         feat_len = input_features.shape[1]
 
+        # 将 input_features 时间维度对齐为 100 的整数倍 (Qwen3 conv_frontend 的 chunk_size)
+        # 彻底规避 1.7B 模型在 Intel Arc GPU 上因动态 Pad 算子触发的 Reshape_2 驱动级崩溃
+        rem = feat_len % 100
+        if rem != 0:
+            pad_len = 100 - rem
+            padded_input_features = np.pad(input_features, ((0, 0), (0, pad_len), (0, 0)), mode="constant")
+        else:
+            padded_input_features = input_features
+
         # 2. ConvFrontend (GPU)
-        conv_out = self.m_conv([input_features])[0]
+        conv_out = self.m_conv([padded_input_features])[0]
         A_conv = conv_out.shape[1]
         expected_len = feat_to_audio_tokens_len(feat_len, 100)
         valid_frames = min(expected_len, A_conv)

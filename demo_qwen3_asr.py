@@ -19,13 +19,6 @@ import keyboard
 import sherpa_onnx
 from pynput import keyboard as pynput_keyboard
 
-try:
-    from ov_qwen3_engine import OpenVinoQwen3Recognizer
-    HAS_OPENVINO_GPU = True
-except Exception as _ov_err:
-    OpenVinoQwen3Recognizer = None
-    HAS_OPENVINO_GPU = False
-
 from PyQt5.QtWidgets import (
     QApplication,
     QWidget,
@@ -71,25 +64,6 @@ class AppConfig:
 
     # 默认选中的模型版本（优先极速版）
     DEFAULT_MODEL_KEY = "0.6b"
-
-    # 支持的计算硬件加速模式
-    BACKENDS = {
-        "cpu": {
-            "key": "cpu",
-            "name": "⚡ CPU 4大核极速 (推荐, ~300ms)",
-            "short_name": "CPU极速",
-            "description": "基于原生 C++ 引擎独占 4 个性能大核，超低延迟、极速出字",
-        },
-        "gpu": {
-            "key": "gpu",
-            "name": "🚀 Intel Arc GPU 混合加速 (实验性)",
-            "short_name": "Arc异构",
-            "description": "重型 Encoder 卸载至 Intel Arc GPU 显卡，Decoder 在 CPU 精确运算",
-        },
-    }
-
-    # 默认计算后端
-    DEFAULT_BACKEND = "cpu"
 
     # 音频流参数配置：16kHz 单声道 16bit 是 ASR 模型的标准输入要求
     SAMPLE_RATE = 16000
@@ -374,44 +348,23 @@ class ModelLoader:
             pass
 
     @classmethod
-    def load_recognizer(cls, preferred_key: str = "0.6b", preferred_backend: str = "cpu") -> Tuple[Optional[Any], str, str, str]:
-        """
-        初始化离线识别引擎。
-        返回: (recognizer, backend_label, active_model_key, active_backend_key)
-        """
+    def load_recognizer(cls, preferred_key: str = "0.6b") -> Tuple[Optional[sherpa_onnx.OfflineRecognizer], str, str]:
+        """初始化离线识别引擎。返回: (recognizer, backend_label, active_model_key)"""
         available = cls.get_available_models()
         if not available:
             app_dir = Win32Utils.get_app_dir()
             print("❌ 未能在当前环境中检测到任何可用的 Qwen3-ASR 模型组件。")
             cls.show_missing_dialog(app_dir)
-            return None, "未找到可用模型", preferred_key, "cpu"
+            return None, "未找到可用模型", preferred_key
 
         # 若指定模型存在则使用，否则平滑 fallback 到存在的第一个
         active_key = preferred_key if preferred_key in available else next(iter(available.keys()))
         components = available[active_key]
 
-        # 尝试使用 Intel Arc GPU 异构引擎
-        if preferred_backend == "gpu" and HAS_OPENVINO_GPU and OpenVinoQwen3Recognizer is not None:
-            try:
-                print(f"\n🚀 正在初始化 {components['name']} [Intel Arc GPU 异构混合加速]...")
-                num_threads = AppConfig.get_optimal_threads()
-                rec = OpenVinoQwen3Recognizer(
-                    model_dir=components["model_dir"],
-                    device_encoder="GPU",
-                    device_decoder="CPU",
-                    num_threads=num_threads
-                )
-                backend_label = f"{components['short_name']} | Intel Arc GPU 混合加速"
-                print(f"✅ {components['name']} [Intel Arc GPU 异构引擎] 加载成功！\n")
-                return rec, backend_label, active_key, "gpu"
-            except Exception as e:
-                print(f"⚠️ Intel Arc GPU 异构加载失败，自动回退至 CPU 极速引擎: {e}")
-
-        # 默认或 Fallback: 原生 C++ CPU 引擎 (4 线程 P-core 独占)
         backend_desc, provider, num_threads = HardwareManager.check_compute_backend()
         backend_label = f"{components['short_name']} | {backend_desc}"
 
-        print(f"🔄 正在初始化 {components['name']} 离线识别引擎 (原生 CPU 4核)...")
+        print(f"🔄 正在初始化 {components['name']} 离线识别引擎...")
         print(f"  - 特征提取前端: {os.path.basename(components['conv_frontend'])}")
         print(f"  - 编码器: {os.path.basename(components['encoder'])}")
         print(f"  - 解码器: {os.path.basename(components['decoder'])}")
@@ -431,7 +384,7 @@ class ModelLoader:
             max_new_tokens=128
         )
         print(f"✅ {components['name']} 加载成功！\n")
-        return recognizer, backend_label, active_key, "cpu"
+        return recognizer, backend_label, active_key
 
 
 # ==============================================================================
@@ -452,8 +405,7 @@ class AsrWorker(QThread):
         self.recording_start_time = 0.0
 
         self.current_model_key = AppConfig.DEFAULT_MODEL_KEY
-        self.current_backend = AppConfig.DEFAULT_BACKEND
-        self.recognizer: Optional[Any] = None
+        self.recognizer: Optional[sherpa_onnx.OfflineRecognizer] = None
         self.backend_label = "初始化中..."
 
         # 持久化单例 PyAudio，避免多次打开关闭引发底层驱动内存崩溃
@@ -461,19 +413,15 @@ class AsrWorker(QThread):
         self.mic_index: Optional[int] = None
         self.target_window_hwnd: Optional[int] = None
 
-        # 录音状态切换请求事件与模型/后端切换请求
+        # 录音状态切换请求事件与模型切换请求
         self._toggle_requested = threading.Event()
         self._switch_model_requested = threading.Event()
         self._target_model_key: str = ""
-        self._switch_backend_requested = threading.Event()
-        self._target_backend: str = ""
 
     def initialize_engine(self):
         """初始化麦克风和 ASR 识别引擎"""
         self.mic_index = HardwareManager.find_mic_device(self.pyaudio_instance)
-        self.recognizer, self.backend_label, self.current_model_key, self.current_backend = ModelLoader.load_recognizer(
-            self.current_model_key, self.current_backend
-        )
+        self.recognizer, self.backend_label, self.current_model_key = ModelLoader.load_recognizer(self.current_model_key)
 
     def toggle_recording(self):
         """触发录音启停切换"""
@@ -493,41 +441,28 @@ class AsrWorker(QThread):
         self._switch_model_requested.set()
         self._toggle_requested.set()
 
-    def request_switch_backend(self, backend_key: str):
-        """请求切换计算硬件后端（CPU / Intel Arc GPU）（线程安全调度）"""
-        if self.is_recording:
-            self.sig_banner_update.emit("⚠️ 录音中请稍后再切换硬件", 1.5)
+    def _do_switch_model(self, target_key: str):
+        """在工作线程内部执行平滑模型销毁与重建"""
+        if not target_key or target_key == self.current_model_key:
             return
-        if backend_key == self.current_backend:
-            return
-        self._target_backend = backend_key
-        self._switch_backend_requested.set()
-        self._toggle_requested.set()
-
-    def _do_switch(self, target_model_key: str, target_backend: str):
-        """在工作线程内部执行平滑引擎销毁与重建"""
-        target_meta = AppConfig.MODELS.get(target_model_key, {})
-        target_name = target_meta.get("short_name", target_model_key)
-        backend_meta = AppConfig.BACKENDS.get(target_backend, {})
-        backend_name = backend_meta.get("short_name", target_backend)
-
-        print(f"\n🔄 [引擎热切换] 正在平滑卸载当前模型并加载: {target_name} ({backend_name}) ...")
-        self.sig_banner_update.emit(f"🔄 正在加载 {target_name} ({backend_name})...", 10.0)
+        target_meta = AppConfig.MODELS.get(target_key, {})
+        target_name = target_meta.get("short_name", target_key)
+        print(f"\n🔄 [模型热切换] 正在平滑卸载当前模型并加载: {target_name} ...")
+        self.sig_banner_update.emit(f"🔄 正在加载 {target_name}...", 8.0)
 
         # 释放旧模型与垃圾回收
         self.recognizer = None
         gc.collect()
 
-        rec, label, active_key, active_backend = ModelLoader.load_recognizer(target_model_key, target_backend)
+        rec, label, active_key = ModelLoader.load_recognizer(target_key)
         if rec:
             self.recognizer = rec
             self.backend_label = label
             self.current_model_key = active_key
-            self.current_backend = active_backend
             self.sig_model_loaded.emit(self.current_model_key, self.backend_label)
-            self.sig_banner_update.emit(f"✅ 已启用 {target_name} ({backend_name})", 2.0)
+            self.sig_banner_update.emit(f"✅ 已启用 {target_name}", 2.0)
             winsound.Beep(800, 150)
-            print(f"🎉 [引擎热切换完成] 当前激活: {self.backend_label}\n")
+            print(f"🎉 [模型热切换完成] 当前激活: {self.backend_label}\n")
         else:
             self.sig_banner_update.emit(f"❌ 加载 {target_name} 失败", 2.0)
 
@@ -548,10 +483,10 @@ class AsrWorker(QThread):
         winsound.Beep(600, 200)
 
         print("👉 单击桌面【悬浮小条】或轻按键盘【F8】键开始录音，再次单击立即识别上屏。")
-        print("👉 可通过系统托盘菜单或悬浮条右键随时切换 0.6B/1.7B 模型，或切换 CPU/Intel Arc GPU 硬件加速。\n")
+        print("👉 可通过系统托盘菜单或悬浮条右键随时切换 0.6B 极速版 / 1.7B 高质量版。\n")
 
         while self.running:
-            # 等待录音触发或模型/硬件切换信号
+            # 等待录音触发或模型切换信号
             self._toggle_requested.wait(timeout=0.1)
             if not self.running:
                 break
@@ -559,13 +494,7 @@ class AsrWorker(QThread):
             # 处理模型热切换请求
             if self._switch_model_requested.is_set():
                 self._switch_model_requested.clear()
-                self._do_switch(self._target_model_key, self.current_backend)
-                continue
-
-            # 处理硬件加速后端热切换请求
-            if self._switch_backend_requested.is_set():
-                self._switch_backend_requested.clear()
-                self._do_switch(self.current_model_key, self._target_backend)
+                self._do_switch_model(self._target_model_key)
                 continue
 
             if self._toggle_requested.is_set():
@@ -597,7 +526,7 @@ class AsrWorker(QThread):
             return
 
         model_meta = AppConfig.MODELS.get(self.current_model_key, {})
-        allow_preview = model_meta.get("allow_realtime_preview", True) and (self.current_backend == "cpu")
+        allow_preview = model_meta.get("allow_realtime_preview", True)
 
         prompt_text = "🎤 Qwen3 正在聆听..." if allow_preview else "🎤 Qwen3 正在高品质采集..."
         self.sig_realtime_text.emit(prompt_text)
@@ -624,7 +553,7 @@ class AsrWorker(QThread):
 
             now = time.time()
             if not allow_preview:
-                # 专职纯净采样：绝对不在此处推理解码，保证 100% 杜绝缓冲区溢出吞字
+                # 针对 1.7B 等高质量大模型：绝对不在此处进行推理解码，专职采样避免缓冲区溢出丢音
                 if (now - last_infer_time > 0.3) and len(frames) > 5:
                     raw_recent = b"".join(frames[-5:])
                     audio_recent = np.frombuffer(raw_recent, dtype=np.int16).astype(np.float32) / 32768.0
@@ -638,7 +567,7 @@ class AsrWorker(QThread):
                         self.sig_realtime_text.emit("🎤 Qwen3 正在高品质采集...")
                     last_infer_time = now
             else:
-                # 针对轻量模型且 CPU 模式：每隔 0.6 秒进行一次轻量实时预览
+                # 针对 0.6B 轻量模型：每隔 0.6 秒进行一次轻量实时预览
                 if self.recognizer and (now - last_infer_time > 0.6) and len(frames) > 8:
                     raw_tmp = b"".join(frames)
                     audio_tmp = np.frombuffer(raw_tmp, dtype=np.int16).astype(np.float32) / 32768.0
@@ -652,14 +581,11 @@ class AsrWorker(QThread):
                         continue
 
                     mute_warned = False
-                    try:
-                        c_stream = self.recognizer.create_stream()
-                        c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_tmp)
-                        self.recognizer.decode_stream(c_stream)
-                        if c_stream.result.text:
-                            self.sig_realtime_text.emit(c_stream.result.text)
-                    except Exception:
-                        pass
+                    c_stream = self.recognizer.create_stream()
+                    c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_tmp)
+                    self.recognizer.decode_stream(c_stream)
+                    if c_stream.result.text:
+                        self.sig_realtime_text.emit(c_stream.result.text)
                     last_infer_time = now
 
         self.is_recording = False
@@ -685,9 +611,7 @@ class AsrWorker(QThread):
 
         model_meta = AppConfig.MODELS.get(self.current_model_key, {})
         tag = model_meta.get("short_name", "Qwen3")
-        backend_meta = AppConfig.BACKENDS.get(self.current_backend, {})
-        backend_tag = backend_meta.get("short_name", "CPU")
-        self.sig_banner_update.emit(f"⚡ 正在识别 ({tag} | {backend_tag})...", 8.0)
+        self.sig_banner_update.emit(f"⚡ 正在识别 ({tag})...", 8.0)
 
         raw_data = b"".join(frames)
         audio_int16 = np.frombuffer(raw_data, dtype=np.int16)
@@ -695,31 +619,18 @@ class AsrWorker(QThread):
         rms_final = float(np.sqrt(np.mean(audio_float32 ** 2)))
 
         duration = len(frames) * AppConfig.CHUNK_SIZE / AppConfig.SAMPLE_RATE
-        print(f"🔍 采集完成: 时长 {duration:.1f}s, RMS 响度 {rms_final:.4f} [模型: {tag} | 后端: {backend_tag}]")
+        print(f"🔍 采集完成: 时长 {duration:.1f}s, RMS 响度 {rms_final:.4f} [使用模型: {tag}]")
 
         if rms_final <= 0.001:
             self.sig_banner_update.emit("⚠️ 麦克风无声音信号", 1.5)
             self.sig_realtime_text.emit("")
             return
 
-        t_infer_start = time.time()
-        text = ""
-
-        try:
-            if self.current_backend == "gpu" and hasattr(self.recognizer, "transcribe"):
-                # Intel Arc GPU 异构引擎
-                text = self.recognizer.transcribe(audio_float32).strip()
-            else:
-                # 原生 C++ CPU 引擎
-                c_stream = self.recognizer.create_stream()
-                c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_float32)
-                self.recognizer.decode_stream(c_stream)
-                text = c_stream.result.text.strip()
-        except Exception as e:
-            print(f"❌ 推理解码异常: {e}")
-
-        infer_duration = time.time() - t_infer_start
-        print(f"📝 [识别结果] ({infer_duration*1000:.1f}ms): '{text}'")
+        c_stream = self.recognizer.create_stream()
+        c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_float32)
+        self.recognizer.decode_stream(c_stream)
+        text = c_stream.result.text.strip()
+        print(f"📝 [识别结果]: '{text}'")
 
         if text:
             # 等待所有物理按键完全释放，保证打字平稳无按键连带冲突
@@ -915,22 +826,6 @@ class FloatingBarUI(QWidget):
             act.triggered.connect(lambda checked=False, k=key: self.worker.request_switch_model(k))
             sub_models.addAction(act)
 
-        # 动态创建计算硬件加速子菜单
-        sub_backends = menu.addMenu("⚙️ 计算硬件加速")
-        current_backend = getattr(self.worker, "current_backend", "cpu")
-        for b_key, b_meta in AppConfig.BACKENDS.items():
-            is_active = (b_key == current_backend)
-            icon_tag = "● " if is_active else "○ "
-            title = f"{icon_tag}{b_meta['name']}"
-            act = QAction(title, sub_backends)
-            if b_key == "gpu" and not HAS_OPENVINO_GPU:
-                act.setText(f"✕ {b_meta['name']} (未检测到OpenVINO)")
-                act.setEnabled(False)
-            else:
-                act.setEnabled(not is_active)
-                act.triggered.connect(lambda checked=False, bk=b_key: self.worker.request_switch_backend(bk))
-            sub_backends.addAction(act)
-
         menu.addSeparator()
 
         act_theme = QAction("🎨 切换主题 (明亮/暗黑)", menu)
@@ -1100,10 +995,6 @@ class TrayManager:
         self.sub_models = self.menu.addMenu("🔄 切换识别模型")
         self._rebuild_model_submenu()
 
-        # 硬件加速切换子菜单
-        self.sub_backends = self.menu.addMenu("⚙️ 计算硬件加速")
-        self._rebuild_backend_submenu()
-
         self.menu.addSeparator()
 
         act_toggle = QAction("👁️ 显示/隐藏悬浮条", self.menu)
@@ -1144,30 +1035,12 @@ class TrayManager:
             act.triggered.connect(lambda checked=False, k=key: self.floating_bar.worker.request_switch_model(k))
             self.sub_models.addAction(act)
 
-    def _rebuild_backend_submenu(self):
-        """重新构建托盘中的硬件加速切换菜单"""
-        self.sub_backends.clear()
-        current_backend = getattr(self.floating_bar.worker, "current_backend", "cpu")
-        for b_key, b_meta in AppConfig.BACKENDS.items():
-            is_active = (b_key == current_backend)
-            icon_tag = "● " if is_active else "○ "
-            title = f"{icon_tag}{b_meta['name']}"
-            act = QAction(title, self.sub_backends)
-            if b_key == "gpu" and not HAS_OPENVINO_GPU:
-                act.setText(f"✕ {b_meta['name']} (未检测到OpenVINO)")
-                act.setEnabled(False)
-            else:
-                act.setEnabled(not is_active)
-                act.triggered.connect(lambda checked=False, bk=b_key: self.floating_bar.worker.request_switch_backend(bk))
-            self.sub_backends.addAction(act)
-
     def update_model_info(self, model_key: str, backend_label: str):
         """动态更新托盘提示文本与菜单信息"""
         self.tray.setToolTip(f"VibeC 语音助手\n{backend_label}")
         if hasattr(self, "act_model_info"):
             self.act_model_info.setText(f"🤖 {backend_label}")
         self._rebuild_model_submenu()
-        self._rebuild_backend_submenu()
 
     def _toggle_bar_visibility(self):
         if self.floating_bar.isVisible():
