@@ -44,7 +44,7 @@ python download_qwen3_asr.py
 ```bash
 python download_qwen3_asr_1.7b.py
 ```
-*(下载完毕后会自动存放于 `qwen3-asr-1.7b-int4/`)*
+*(下载完毕后会自动存放于 `sherpa-onnx-qwen3-asr-1.7B-int8/`)*
 
 ---
 

@@ -55,7 +55,6 @@ class AppConfig:
             "candidate_dirs": [
                 "sherpa-onnx-qwen3-asr-1.7B-int8",
                 "qwen3-asr-1.7b-int8",
-                "qwen3-asr-1.7b-int4",
             ],
             "allow_realtime_preview": False,
             "description": "高精度大模型，适合长句/复杂专有名词；纯净录音保证 100% 不丢音频",
@@ -288,14 +287,14 @@ class ModelLoader:
                     continue
 
                 encoder = None
-                for enc_name in ["encoder.int8.onnx", "encoder.int4.onnx", "encoder.onnx"]:
+                for enc_name in ["encoder.int8.onnx", "encoder.onnx"]:
                     p = os.path.join(model_dir, enc_name)
                     if os.path.exists(p):
                         encoder = p
                         break
 
                 decoder = None
-                for dec_name in ["decoder.int8.onnx", "decoder_step.int4.onnx", "decoder.onnx"]:
+                for dec_name in ["decoder.int8.onnx", "decoder.onnx"]:
                     p = os.path.join(model_dir, dec_name)
                     if os.path.exists(p):
                         decoder = p
