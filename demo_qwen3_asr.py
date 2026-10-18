@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
     QAction,
     QMessageBox
 )
-from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QIcon, QPixmap
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QIcon, QPixmap, QCursor
 from PyQt5.QtCore import Qt, QTimer, QRectF, QPoint, pyqtSignal, QThread
 
 
@@ -146,9 +146,27 @@ class Win32Utils:
         try:
             GWL_EXSTYLE = -20
             WS_EX_NOACTIVATE = 0x08000000
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+
             user32 = ctypes.windll.user32
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
+            # 兼容 32 位与 64 位
+            GetWindowLong = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            SetWindowLong = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            GetWindowLong.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            GetWindowLong.restype = ctypes.c_longlong
+            SetWindowLong.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
+            SetWindowLong.restype = ctypes.c_longlong
+
+            style = GetWindowLong(hwnd, GWL_EXSTYLE)
+            SetWindowLong(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+            )
         except Exception as e:
             print(f"⚠️ 设置无激活样式警告: {e}")
 
@@ -740,12 +758,16 @@ class FloatingBarUI(QWidget):
         self.setCursor(Qt.PointingHandCursor)
 
     def _init_geometry(self):
-        """默认将悬浮条放置在屏幕顶部居中"""
+        """默认将悬浮条放置在鼠标当前所在屏幕或主屏幕顶部居中"""
         self.setFixedSize(AppConfig.BAR_WIDTH, AppConfig.BAR_HEIGHT)
-        desktop = QApplication.desktop()
-        rect = desktop.availableGeometry()
-        center_x = (rect.width() - AppConfig.BAR_WIDTH) // 2
-        self.move(center_x, 35)
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen:
+            rect = screen.availableGeometry()
+            center_x = rect.x() + (rect.width() - AppConfig.BAR_WIDTH) // 2
+            center_y = rect.y() + 35
+            self.move(center_x, center_y)
+        else:
+            self.move(100, 35)
 
     def _bind_signals(self):
         """连接后台工作线程的 PyQt 信号"""
@@ -848,9 +870,11 @@ class FloatingBarUI(QWidget):
         self.update()
 
     def center_to_top(self):
-        """恢复居中置顶位置"""
-        rect = QApplication.desktop().availableGeometry()
-        self.move((rect.width() - AppConfig.BAR_WIDTH) // 2, 35)
+        """恢复居中置顶位置到当前活动屏幕"""
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen:
+            rect = screen.availableGeometry()
+            self.move(rect.x() + (rect.width() - AppConfig.BAR_WIDTH) // 2, rect.y() + 35)
 
     def _on_recording_started(self):
         self.is_recording = True
@@ -1014,7 +1038,15 @@ class TrayManager:
         self.menu.addAction(act_exit)
 
         self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.floating_bar.center_to_top()
+            self.floating_bar.show()
+            self.floating_bar.raise_()
+            self.floating_bar.activateWindow()
 
     def _rebuild_model_submenu(self):
         """重新构建托盘中的模型切换菜单"""
@@ -1040,6 +1072,15 @@ class TrayManager:
         if hasattr(self, "act_model_info"):
             self.act_model_info.setText(f"🤖 {backend_label}")
         self._rebuild_model_submenu()
+        try:
+            self.tray.showMessage(
+                "VibeC 语音助手就绪",
+                f"已就绪: {backend_label}\n轻按 F8 开始录音与自动打字",
+                QSystemTrayIcon.Information,
+                3000
+            )
+        except Exception:
+            pass
 
     def _toggle_bar_visibility(self):
         if self.floating_bar.isVisible():
