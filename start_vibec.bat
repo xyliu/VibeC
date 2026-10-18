@@ -9,6 +9,6 @@ echo [*] Default Hotkey: F8 or Win+Shift+H
 echo [*] The floating bar will appear at the TOP-CENTER of your active screen.
 echo.
 
-".venv\Scripts\python.exe" -u demo_qwen3_asr.py
+"%~dp0.venv\Scripts\python.exe" -u "%~dp0demo_qwen3_asr.py"
 
 pause
