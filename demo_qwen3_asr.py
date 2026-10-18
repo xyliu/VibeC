@@ -13,6 +13,12 @@ import threading
 import gc
 from typing import Optional, Tuple, Dict, Any
 
+# 优先导入 onnxruntime 规避 Windows 下与 sherpa-onnx 内置 onnxruntime.dll 的加载例程冲突
+try:
+    import onnxruntime
+except Exception:
+    pass
+
 import numpy as np
 import pyaudio
 import keyboard
@@ -229,6 +235,16 @@ class HardwareManager:
         """探测真实的计算硬件与自适应多核并发配置"""
         cpu_cores = os.cpu_count() or 4
         optimal_threads = AppConfig.get_optimal_threads()
+
+        use_amd = os.environ.get("USE_AMD_NPU", "0") == "1" or "--amd-npu" in sys.argv
+        if use_amd:
+            try:
+                import onnxruntime as ort
+                if "DmlExecutionProvider" in ort.get_available_providers():
+                    return "AMD NPU / DirectML 硬件加速", "amd_dml", optimal_threads
+            except Exception as e:
+                print(f"[NPU Check Warning] {e}")
+
         desc = f"CPU 性能大核加速 ({optimal_threads}线程/全核{cpu_cores})"
         return desc, "cpu", optimal_threads
 
@@ -387,6 +403,17 @@ class ModelLoader:
         print(f"  - 解码器: {os.path.basename(components['decoder'])}")
         print(f"  - 词表目录: {components['tokenizer']}")
         print(f"  - 计算后端: {backend_label}")
+
+        if provider == "amd_dml":
+            try:
+                from amd_qwen3_engine import AmdQwen3Recognizer
+                print(f"🚀 [硬件加速] 正在加载 {components['name']} (AMD NPU / DirectML 引擎)...")
+                recognizer = AmdQwen3Recognizer(components["model_dir"], use_dml=True, num_threads=num_threads)
+                print(f"✅ {components['name']} (AMD NPU 加速) 加载成功！\n")
+                return recognizer, backend_label, active_key
+            except Exception as e:
+                print(f"⚠️ 加载 AMD NPU 硬件加速失败，回退到 CPU 引擎: {e}")
+                provider = "cpu"
 
         recognizer = sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
             conv_frontend=components["conv_frontend"],
@@ -643,10 +670,13 @@ class AsrWorker(QThread):
             self.sig_realtime_text.emit("")
             return
 
-        c_stream = self.recognizer.create_stream()
-        c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_float32)
-        self.recognizer.decode_stream(c_stream)
-        text = c_stream.result.text.strip()
+        if hasattr(self.recognizer, "transcribe"):
+            text = self.recognizer.transcribe(audio_float32).strip()
+        else:
+            c_stream = self.recognizer.create_stream()
+            c_stream.accept_waveform(AppConfig.SAMPLE_RATE, audio_float32)
+            self.recognizer.decode_stream(c_stream)
+            text = c_stream.result.text.strip()
         print(f"📝 [识别结果]: '{text}'")
 
         if text:
